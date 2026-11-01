@@ -1,222 +1,179 @@
+"""Indicator and signal logic for scanner.py.
 
-import time
-import requests
+Pure functions only: no network calls, no printing, so everything here
+can be tested on its own. `add_indicators` and `signal_at` keep the same
+names as before, so scanner.py can import them directly.
+"""
+
+from dataclasses import dataclass
+from typing import Optional
+
 import pandas as pd
 
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
-BINANCE_URL = "https://api.binance.com/api/v3"
-
-STARTING_BALANCE = 200.00
-FEE_RATE = 0.001
-CANDLES = 300
-
-session = requests.Session()
+BUY, SELL, HOLD = "BUY", "SELL", "HOLD"
 
 
-def get_top_coins():
-    response = session.get(
-        COINGECKO_URL,
-        params={
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": 50,
-            "page": 1,
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
-    return response.json()
+@dataclass(frozen=True)
+class SignalConfig:
+    fast: int = 9
+    slow: int = 21
+    rsi_period: int = 14
+    rsi_low: float = 50.0
+    rsi_high: float = 65.0
+    trend_period: Optional[int] = 100    # None disables the trend filter
+    vol_period: int = 20
+    min_vol_ratio: float = 1.0           # 0 disables the volume filter
+    atr_period: int = 14
+    atr_stop_mult: float = 2.0
+
+    def __post_init__(self):
+        if self.fast >= self.slow:
+            raise ValueError("fast period must be shorter than slow period")
+        if not 0 <= self.rsi_low < self.rsi_high <= 100:
+            raise ValueError("RSI band must satisfy 0 <= low < high <= 100")
+        if self.trend_period is not None and self.trend_period <= self.slow:
+            raise ValueError("trend_period must be longer than slow period")
 
 
-def get_binance_symbols():
-    response = session.get(
-        f"{BINANCE_URL}/exchangeInfo", timeout=20
-    )
-    response.raise_for_status()
-
-    return {
-        item["symbol"]
-        for item in response.json()["symbols"]
-        if item["status"] == "TRADING"
-        and item["quoteAsset"] == "USDT"
-        and item["isSpotTradingAllowed"]
-    }
+DEFAULT_CONFIG = SignalConfig()
 
 
-def get_candles(symbol):
-    response = session.get(
-        f"{BINANCE_URL}/klines",
-        params={
-            "symbol": symbol,
-            "interval": "1h",
-            "limit": CANDLES,
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
-
-    rows = response.json()
-    columns = [
-        "time", "open", "high", "low", "close",
-        "volume", "close_time", "quote_volume",
-        "trades", "buy_volume", "buy_quote_volume", "ignore"
-    ]
-
-    df = pd.DataFrame(rows, columns=columns)
-    df["close"] = pd.to_numeric(df["close"])
-    df["volume"] = pd.to_numeric(df["volume"])
-
-    # Exclude the unfinished hourly candle.
-    return df.iloc[:-1].copy().reset_index(drop=True)
-
-
-def add_indicators(df):
+def _as_numeric(df):
     df = df.copy()
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
-    df["ema9"] = df["close"].ewm(
-        span=9, adjust=False
+
+def add_indicators(df, cfg=DEFAULT_CONFIG):
+    """Return a copy of df with indicator columns added."""
+    if df is None or df.empty:
+        raise ValueError("empty candle data")
+    for col in ("close", "volume"):
+        if col not in df.columns:
+            raise ValueError(f"missing required column: {col}")
+
+    df = _as_numeric(df)
+    close = df["close"]
+
+    df["ema_fast"] = close.ewm(span=cfg.fast, adjust=False).mean()
+    df["ema_slow"] = close.ewm(span=cfg.slow, adjust=False).mean()
+
+    if cfg.trend_period:
+        df["ema_trend"] = close.ewm(
+            span=cfg.trend_period, adjust=False, min_periods=cfg.trend_period
+        ).mean()
+
+    # RSI (Wilder smoothing)
+    change = close.diff()
+    avg_gain = change.clip(lower=0).ewm(
+        alpha=1 / cfg.rsi_period, min_periods=cfg.rsi_period, adjust=False
     ).mean()
-
-    df["ema21"] = df["close"].ewm(
-        span=21, adjust=False
+    avg_loss = (-change.clip(upper=0)).ewm(
+        alpha=1 / cfg.rsi_period, min_periods=cfg.rsi_period, adjust=False
     ).mean()
-
-    change = df["close"].diff()
-    gains = change.clip(lower=0)
-    losses = -change.clip(upper=0)
-
-    avg_gain = gains.ewm(
-        alpha=1 / 14, min_periods=14, adjust=False
-    ).mean()
-
-    avg_loss = losses.ewm(
-        alpha=1 / 14, min_periods=14, adjust=False
-    ).mean()
-
     rs = avg_gain / avg_loss.replace(0, float("nan"))
-    df["rsi"] = 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    # No down moves at all means RSI is 100, not NaN.
+    df["rsi"] = rsi.where(avg_loss != 0, 100.0)
+
+    # Volume relative to its recent average
+    avg_vol = df["volume"].rolling(cfg.vol_period).mean()
+    df["vol_ratio"] = df["volume"] / avg_vol.replace(0, float("nan"))
+
+    # ATR (needs high and low; skipped if they are missing)
+    if {"high", "low"}.issubset(df.columns):
+        prev_close = close.shift(1)
+        true_range = pd.concat(
+            [
+                df["high"] - df["low"],
+                (df["high"] - prev_close).abs(),
+                (df["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        df["atr"] = true_range.ewm(
+            alpha=1 / cfg.atr_period, min_periods=cfg.atr_period, adjust=False
+        ).mean()
+    else:
+        df["atr"] = float("nan")
 
     return df
 
 
-def signal_at(df, i):
-    row = df.iloc[i]
-    previous = df.iloc[i - 1]
+def signal_at(df, i, cfg=DEFAULT_CONFIG):
+    """Signal using only data up to and including row i (no look-ahead)."""
+    if i < 1 or i >= len(df):
+        return HOLD
 
-    crossed_up = (
-        previous["ema9"] <= previous["ema21"]
-        and row["ema9"] > row["ema21"]
-    )
+    row, prev = df.iloc[i], df.iloc[i - 1]
 
-    crossed_down = (
-        previous["ema9"] >= previous["ema21"]
-        and row["ema9"] < row["ema21"]
-    )
+    needed = [row["ema_fast"], row["ema_slow"], prev["ema_fast"],
+              prev["ema_slow"], row["rsi"]]
+    if any(pd.isna(v) for v in needed):
+        return HOLD
 
-    if crossed_up and 50 <= row["rsi"] <= 65:
-        return "BUY"
+    crossed_up = (prev["ema_fast"] <= prev["ema_slow"]
+                  and row["ema_fast"] > row["ema_slow"])
+    crossed_down = (prev["ema_fast"] >= prev["ema_slow"]
+                    and row["ema_fast"] < row["ema_slow"])
 
     if crossed_down:
-        return "SELL"
+        return SELL
 
-    return "HOLD"
+    if crossed_up and cfg.rsi_low <= row["rsi"] <= cfg.rsi_high:
+        if cfg.trend_period:
+            trend = row.get("ema_trend")
+            if pd.isna(trend) or row["close"] <= trend:
+                return HOLD
+        if cfg.min_vol_ratio > 0:
+            ratio = row.get("vol_ratio")
+            if pd.isna(ratio) or ratio < cfg.min_vol_ratio:
+                return HOLD
+        return BUY
 
-
-def backtest(df):
-    balance = STARTING_BALANCE
-    quantity = 0.0
-    entry_price = None
-    trades = 0
-    wins = 0
-
-    for i in range(22, len(df)):
-        price = float(df.iloc[i]["close"])
-        signal = signal_at(df, i)
-
-        if signal == "BUY" and quantity == 0:
-            quantity = balance * (1 - FEE_RATE) / price
-            entry_price = price
-            balance = 0.0
-
-        elif signal == "SELL" and quantity > 0:
-            balance = quantity * price * (1 - FEE_RATE)
-            trades += 1
-
-            if price > entry_price:
-                wins += 1
-
-            quantity = 0.0
-            entry_price = None
-
-    if quantity > 0:
-        balance = quantity * float(df.iloc[-1]["close"])
-        balance *= 1 - FEE_RATE
-
-    profit = balance - STARTING_BALANCE
-    return balance, profit, trades, wins
+    return HOLD
 
 
-def main():
-    print("Loading top 50 cryptocurrencies...")
-    coins = get_top_coins()
-    binance_symbols = get_binance_symbols()
+def latest_signal(df, cfg=DEFAULT_CONFIG):
+    """Summary of the most recent closed candle, for display or alerts."""
+    i = len(df) - 1
+    row = df.iloc[i]
+    atr = row.get("atr")
+    stop = None
+    if atr is not None and not pd.isna(atr):
+        stop = float(row["close"] - cfg.atr_stop_mult * atr)
 
-    results = []
-
-    for coin in coins:
-        symbol = coin["symbol"].upper() + "USDT"
-
-        if symbol not in binance_symbols:
-            continue
-
-        try:
-            df = add_indicators(get_candles(symbol))
-
-            if len(df) < 50:
-                continue
-
-            last = len(df) - 1
-            signal = signal_at(df, last)
-
-            balance, profit, trades, wins = backtest(df)
-
-            results.append({
-                "symbol": symbol,
-                "profit": profit,
-                "trades": trades,
-                "wins": wins,
-            })
-
-            print(
-                f"{symbol:<14} "
-                f"Price: {df.iloc[last]['close']:.6g} "
-                f"RSI: {df.iloc[last]['rsi']:.1f} "
-                f"Signal: {signal:<4} "
-                f"Backtest P/L: ${profit:.2f} "
-                f"Trades: {trades}"
-            )
-
-            time.sleep(0.15)
-
-        except (requests.RequestException, ValueError, KeyError) as error:
-            print(f"Skipping {symbol}: {error}")
-
-    if results:
-        total_profit = sum(item["profit"] for item in results)
-        total_trades = sum(item["trades"] for item in results)
-        total_wins = sum(item["wins"] for item in results)
-
-        print("\n--- HISTORICAL TEST SUMMARY ---")
-        print(f"Coins tested: {len(results)}")
-        print(f"Starting balance per coin: ${STARTING_BALANCE:.2f}")
-        print(f"Combined simulated P/L: ${total_profit:.2f}")
-        print(f"Completed trades: {total_trades}")
-
-        if total_trades:
-            print(f"Win rate: {100 * total_wins / total_trades:.1f}%")
-        else:
-            print("Win rate: No completed trades")
+    return {
+        "signal": signal_at(df, i, cfg),
+        "price": float(row["close"]),
+        "rsi": None if pd.isna(row["rsi"]) else float(row["rsi"]),
+        "vol_ratio": None if pd.isna(row["vol_ratio"]) else float(row["vol_ratio"]),
+        "suggested_stop": stop,
+    }
 
 
 if __name__ == "__main__":
-    main()
+    # Self-check on synthetic data (no network needed).
+    import random
+
+    random.seed(3)
+    price, rows = 100.0, []
+    for _ in range(600):
+        open_ = price
+        price *= 1 + random.gauss(0.0003, 0.01)
+        high = max(open_, price) * 1.003
+        low = min(open_, price) * 0.997
+        rows.append([open_, high, low, price, random.uniform(50, 150)])
+
+    data = pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"])
+    data = add_indicators(data)
+
+    counts = {BUY: 0, SELL: 0, HOLD: 0}
+    for k in range(len(data)):
+        counts[signal_at(data, k)] += 1
+
+    print("Signal counts:", counts)
+    print("Latest:", latest_signal(data))
+
