@@ -1,128 +1,206 @@
+import csv
+import itertools
+import json
+import math
+import os
+import time
 
 import requests
-import time
 
 COINS = ["bitcoin", "ethereum", "solana", "ripple", "cardano"]
 
 DAYS = 90
-SHORT_WINDOW = 6
-LONG_WINDOW = 24
-
-FEE = 0.001
 STARTING_CASH = 1000
+FEE = 0.001            # per side
+SLIPPAGE = 0.0005      # per side, adverse
+TRAIN_FRACTION = 0.7
+MIN_TRAIN_TRADES = 3
+
+DEFAULT_PAIR = (6, 24)
+SHORT_GRID = [3, 6, 9, 12]
+LONG_GRID = [24, 48, 72, 120]
+
+CACHE_DIR = "cache"
+CACHE_TTL = 3600       # seconds
 
 
-def get_prices(coin):
-    url = (
-        f"https://api.coingecko.com/api/v3/coins/"
-        f"{coin}/market_chart"
-    )
+def get_prices(coin, retries=5):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{coin}_{DAYS}d.json")
 
-    params = {
-        "vs_currency": "usd",
-        "days": DAYS
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL:
+        with open(path) as f:
+            return json.load(f)
+
+    url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart"
+    params = {"vs_currency": "usd", "days": DAYS}
+
+    for attempt in range(retries):
+        response = requests.get(url, params=params, timeout=30)
+        if response.status_code == 429:
+            time.sleep(15 * (attempt + 1))
+            continue
+        response.raise_for_status()
+        prices = response.json().get("prices", [])
+        with open(path, "w") as f:
+            json.dump(prices, f)
+        return prices
+
+    raise RuntimeError("Rate limited by CoinGecko after several retries")
+
+
+def sma(values, window):
+    out = [None] * len(values)
+    running = 0.0
+    for i, v in enumerate(values):
+        running += v
+        if i >= window:
+            running -= values[i - window]
+        if i >= window - 1:
+            out[i] = running / window
+    return out
+
+
+def simulate(values, short, long_):
+    """Signal on bar i's close, fill at bar i+1's price (no look-ahead)."""
+    fast, slow = sma(values, short), sma(values, long_)
+    cash, qty, cash_in = STARTING_CASH, 0.0, 0.0
+    equity, trades, bars_in = [], [], 0
+    pending = None
+
+    for i in range(long_, len(values)):
+        price = values[i]
+
+        if pending == "buy" and qty == 0:
+            fill = price * (1 + SLIPPAGE)
+            cash_in = cash
+            qty = cash * (1 - FEE) / fill
+            cash = 0.0
+        elif pending == "sell" and qty > 0:
+            fill = price * (1 - SLIPPAGE)
+            cash = qty * fill * (1 - FEE)
+            qty = 0.0
+            trades.append(cash / cash_in - 1)
+        pending = None
+
+        equity.append(cash + qty * price)
+        if qty > 0:
+            bars_in += 1
+
+        if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
+            pending = "buy"
+        elif fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]:
+            pending = "sell"
+
+    return equity, trades, bars_in
+
+
+def metrics(equity, trades, bars_in):
+    peak, max_dd = equity[0], 0.0
+    for e in equity:
+        peak = max(peak, e)
+        max_dd = min(max_dd, e / peak - 1)
+
+    rets = [equity[i] / equity[i - 1] - 1 for i in range(1, len(equity))]
+    mean = sum(rets) / len(rets)
+    sd = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1))
+    sharpe = mean / sd * math.sqrt(24 * 365) if sd else 0.0
+
+    wins = sum(1 for t in trades if t > 0)
+    return {
+        "return": equity[-1] / STARTING_CASH - 1,
+        "max_dd": max_dd,
+        "sharpe": sharpe,
+        "trades": len(trades),
+        "win_rate": wins / len(trades) if trades else 0.0,
+        "exposure": bars_in / len(equity),
     }
 
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
 
-    data = response.json()
-    prices = data.get("prices", [])
-
-    return prices
-
-
-def backtest(coin):
+def run_coin(coin):
     prices = get_prices(coin)
+    if len(prices) < 500:
+        print(f"{coin}: not enough data ({len(prices)} points)")
+        return None
 
-    if len(prices) < LONG_WINDOW + 2:
-        print(f"{coin}: Not enough price data.")
-        return
+    gaps = sorted(
+        (prices[i][0] - prices[i - 1][0]) / 60000 for i in range(1, len(prices))
+    )
+    median_gap = gaps[len(gaps) // 2]
+    if median_gap > 90:
+        print(f"{coin}: data is not hourly (median gap {median_gap:.0f} min), skipped")
+        return None
 
-    # Check the time gaps between observations.
-    gaps = [
-        (prices[i][0] - prices[i - 1][0]) / 60000
-        for i in range(1, len(prices))
-    ]
+    values = [p[1] for p in prices]
+    split = int(len(values) * TRAIN_FRACTION)
+    train = values[:split]
 
-    average_gap = sum(gaps) / len(gaps)
+    # Parameter sweep on the training window only.
+    best = None
+    for s, l in itertools.product(SHORT_GRID, LONG_GRID):
+        if s >= l:
+            continue
+        m = metrics(*simulate(train, s, l))
+        if m["trades"] < MIN_TRAIN_TRADES:
+            continue
+        if best is None or m["sharpe"] > best[0]["sharpe"]:
+            best = (m, s, l)
 
-    print(f"\n{coin.upper()}")
-    print(f"Price observations: {len(prices)}")
-    print(f"Average time between observations: {average_gap:.1f} minutes")
+    def test(s, l):
+        # Start l bars early so the averages are warm when the test begins.
+        return metrics(*simulate(values[split - l:], s, l))
 
-    if average_gap > 90:
-        print("Warning: Data is not hourly enough for an hourly backtest.")
+    buy_hold = (values[-1] / values[split]) * (1 - FEE) ** 2 - 1
+    default_test = test(*DEFAULT_PAIR)
 
-    values = [item[1] for item in prices]
+    print(f"\n{coin.upper()}  (test window: {len(values) - split} hourly bars)")
+    print(f"  Buy & hold:           {buy_hold * 100:7.2f}%")
+    print(
+        f"  Default {DEFAULT_PAIR}:     {default_test['return'] * 100:7.2f}%  "
+        f"DD {default_test['max_dd'] * 100:6.2f}%  trades {default_test['trades']}"
+    )
 
-    cash = STARTING_CASH
-    quantity = 0
-    trades = 0
-    wins = 0
-    entry_price = 0
+    row = {"coin": coin, "buy_hold": buy_hold, "default_return": default_test["return"]}
 
-    for i in range(LONG_WINDOW, len(values) - 1):
-        short_average = sum(
-            values[i - SHORT_WINDOW:i]
-        ) / SHORT_WINDOW
-
-        long_average = sum(
-            values[i - LONG_WINDOW:i]
-        ) / LONG_WINDOW
-
-        previous_short = sum(
-            values[i - SHORT_WINDOW - 1:i - 1]
-        ) / SHORT_WINDOW
-
-        previous_long = sum(
-            values[i - LONG_WINDOW - 1:i - 1]
-        ) / LONG_WINDOW
-
-        buy_signal = (
-            previous_short <= previous_long
-            and short_average > long_average
+    if best is None:
+        print("  Tuned: no parameter pair produced enough training trades")
+    else:
+        _, s, l = best
+        t = test(s, l)
+        print(
+            f"  Tuned ({s},{l}):        {t['return'] * 100:7.2f}%  "
+            f"DD {t['max_dd'] * 100:6.2f}%  Sharpe {t['sharpe']:5.2f}  "
+            f"trades {t['trades']}  win {t['win_rate'] * 100:.0f}%  "
+            f"in-market {t['exposure'] * 100:.0f}%"
         )
-
-        sell_signal = (
-            previous_short >= previous_long
-            and short_average < long_average
+        row.update(
+            short=s, long=l, tuned_return=t["return"], max_dd=t["max_dd"],
+            sharpe=t["sharpe"], trades=t["trades"], win_rate=t["win_rate"],
         )
-
-        # Execute at the next available observation.
-        next_price = values[i + 1]
-
-        if buy_signal and quantity == 0:
-            entry_price = next_price
-            quantity = (cash * (1 - FEE)) / next_price
-            cash = 0
-            trades += 1
-
-        elif sell_signal and quantity > 0:
-            cash = quantity * next_price * (1 - FEE)
-
-            if next_price > entry_price:
-                wins += 1
-
-            quantity = 0
-
-    final_value = cash + quantity * values[-1]
-    profit = final_value - STARTING_CASH
-    return_percent = (profit / STARTING_CASH) * 100
-
-    win_rate = (wins / trades * 100) if trades else 0
-
-    print(f"Starting balance: ${STARTING_CASH:.2f}")
-    print(f"Final balance: ${final_value:.2f}")
-    print(f"Profit/loss: ${profit:.2f}")
-    print(f"Return: {return_percent:.2f}%")
-    print(f"Completed trades: {wins} wins out of {trades} entries")
-    print(f"Win rate: {win_rate:.2f}%")
+    return row
 
 
-for coin in COINS:
-    try:
-        backtest(coin)
+def main():
+    rows = []
+    for coin in COINS:
+        try:
+            row = run_coin(coin)
+            if row:
+                rows.append(row)
+        except Exception as error:
+            print(f"{coin}: Error - {error}")
         time.sleep(3)
-    except Exception as error:
-        print(f"{coin}: Error - {error}")
+
+    if rows:
+        fields = sorted({k for r in rows for k in r}, key=lambda k: (k != "coin", k))
+        with open("results.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        print("\nSaved results.csv")
+
+
+if __name__ == "__main__":
+    main()
+
+ 
