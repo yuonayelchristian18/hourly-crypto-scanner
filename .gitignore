@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+paper_state.json
+paper_log.csv
+scanner_results.csv
+walkforward_results.csv
+cache/
