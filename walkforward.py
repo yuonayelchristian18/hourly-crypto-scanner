@@ -21,6 +21,8 @@ RULES OF THE GAME:
 - Only the TEST half (last 30% of time) is honest. Never tune on it.
 - --sweep picks settings on TRAIN only and shows how they did on TEST.
 - Costs default to optimistic values; try --fee 0.0025 --slippage 0.002 for a harsher check.
+- Trades whose stop is closer than MIN_STOP_COST_MULT x round-trip cost are skipped
+  (costs would eat most of the R). Set --min-stop-cost-mult 0 to turn this off.
 """
 
 import argparse
@@ -43,6 +45,7 @@ SLIPPAGE_PER_SIDE = 0.0015
 START_BALANCE = 200.0
 RISK_DOLLARS = 2.0
 TRAIN_FRACTION = 0.7
+MIN_STOP_COST_MULT = 5.0
 
 STABLES = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDS",
            "BUSD", "USD1", "USDD", "EURC", "GUSD", "PAX", "WBTC", "CBBTC", "WETH"}
@@ -182,6 +185,15 @@ def _size(entry, stop, balance):
     return min(RISK_DOLLARS / risk_per_unit, balance / (entry * (1 + FEE_PER_SIDE)))
 
 
+def _stop_too_tight(entry, stop):
+    """True when the stop distance is small compared with the round-trip cost.
+    Costs would then eat a large share of every R, so the trade is skipped."""
+    if MIN_STOP_COST_MULT <= 0:
+        return False
+    round_trip = 2 * (FEE_PER_SIDE + SLIPPAGE_PER_SIDE)
+    return (entry - stop) / entry < MIN_STOP_COST_MULT * round_trip
+
+
 def summarize(t):
     if t is None or t.empty:
         return {"trades": 0}
@@ -235,7 +247,7 @@ def run_backtest(df, cfg):
         atr = atrs[i]
         stop = min(float(setup["sweep_low"]), entry - cfg.atr_stop_mult * atr) \
             - cfg.stop_buffer_atr * atr
-        if not (0 < stop < entry):
+        if not (0 < stop < entry) or _stop_too_tight(entry, stop):
             i += 1
             continue
         qty = _size(entry, stop, balance)
@@ -288,7 +300,7 @@ def run_turtle(df, cfg, entry_n=20, exit_n=10):
         entry_i = i + 1
         entry = opens[entry_i] * (1 + SLIPPAGE_PER_SIDE)
         stop = entry - cfg.atr_stop_mult * atrs[i]
-        if not (0 < stop < entry):
+        if not (0 < stop < entry) or _stop_too_tight(entry, stop):
             i += 1
             continue
         qty = _size(entry, stop, balance)
@@ -362,7 +374,7 @@ def run_meanrev(pr, rsi_max=20.0, target_atr=1.0, stop_atr=2.0, max_hold=24):
         entry = opens[entry_i] * (1 + SLIPPAGE_PER_SIDE)
         stop = entry - stop_atr * atrs[i]
         target = entry + target_atr * atrs[i]
-        if not (0 < stop < entry):
+        if not (0 < stop < entry) or _stop_too_tight(entry, stop):
             i += 1
             continue
         qty = _size(entry, stop, balance)
@@ -440,6 +452,13 @@ def run_sweep(preps, cut, min_train=100):
 
 def report(combined):
     combined = combined.sort_values("entry_time")
+
+    combined["stop_pct"] = (combined["entry"] - combined["stop"]) / combined["entry"] * 100
+    print("\nBY OUTCOME:")
+    print(combined.groupby("outcome")["R_multiple"].agg(["count", "mean"]).round(2))
+    print("median stop %:", round(float(combined["stop_pct"].median()), 2),
+          "| round-trip cost %:", round(2 * (FEE_PER_SIDE + SLIPPAGE_PER_SIDE) * 100, 2))
+
     print("\nPER-PAIR (sorted by net R):")
     rows = [{"pair": pair, **summarize(g)} for pair, g in combined.groupby("pair")]
     table = pd.DataFrame(rows).sort_values("net_R", ascending=False)
@@ -488,7 +507,7 @@ def download_all(pairs, args):
 
 
 def main():
-    global FEE_PER_SIDE, SLIPPAGE_PER_SIDE
+    global FEE_PER_SIDE, SLIPPAGE_PER_SIDE, MIN_STOP_COST_MULT
     p = argparse.ArgumentParser()
     p.add_argument("--source", choices=["coinbase", "kraken"], default="coinbase")
     p.add_argument("--pairs", default="auto",
@@ -509,6 +528,9 @@ def main():
     p.add_argument("--sweep", action="store_true", help="meanrev: try many settings (train/test).")
     p.add_argument("--fee", type=float, default=None, help="Fee per side, e.g. 0.0025 = 0.25%%.")
     p.add_argument("--slippage", type=float, default=None, help="Slippage per side, e.g. 0.002.")
+    p.add_argument("--min-stop-cost-mult", type=float, default=None,
+                   help="Skip trades whose stop distance is under this multiple of the "
+                        "round-trip cost (default 5, 0 = off).")
     p.add_argument("--csv", default="walkforward_trades.csv")
     args = p.parse_args()
 
@@ -516,6 +538,8 @@ def main():
         FEE_PER_SIDE = args.fee
     if args.slippage is not None:
         SLIPPAGE_PER_SIDE = args.slippage
+    if args.min_stop_cost_mult is not None:
+        MIN_STOP_COST_MULT = args.min_stop_cost_mult
 
     if args.pairs == "auto":
         if args.source != "coinbase":
@@ -527,7 +551,8 @@ def main():
         pairs = [x.strip() for x in args.pairs.split(",") if x.strip()]
 
     print(f"Testing {len(pairs)} pairs | {args.interval}m | {args.days} days | {args.source} | "
-          f"strategy={args.strategy} | fee {FEE_PER_SIDE:.4f} + slip {SLIPPAGE_PER_SIDE:.4f} per side")
+          f"strategy={args.strategy} | fee {FEE_PER_SIDE:.4f} + slip {SLIPPAGE_PER_SIDE:.4f} per side | "
+          f"min stop = {MIN_STOP_COST_MULT:g}x cost")
     cfg = SignalConfig()
     t_start = time.time()
     dfs = download_all(pairs, args)
