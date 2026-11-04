@@ -1,21 +1,25 @@
-
 """
-walkforward.py — Kraken 15m historical trading simulation.
+walkforward.py — 15m historical trading simulation.
 
-Reports individual entry filters so we can identify why trades
-are or are not being generated.
+Reports individual entry filters plus a setup funnel so we can
+identify why trades are or are not being generated.
 
 Uses closed candles, next-candle entries, stop/target execution,
 fees, slippage and a $200 starting balance.
 
+DATA SOURCES:
+- coinbase (default): paginated history, any number of days.
+- kraken: at most 720 recent candles (API limit, cannot page back).
+
 IMPORTANT:
-- Kraken OHLC provides at most 720 recent candles.
 - This tests 15m signals only, not the scanner's 5m/1h/4h filters.
 - No live orders are placed.
 """
 
 import argparse
 import time
+from collections import Counter
+
 import requests
 import pandas as pd
 
@@ -28,6 +32,7 @@ from signals import (
 )
 
 KRAKEN_URL = "https://api.kraken.com/0/public"
+COINBASE_URL = "https://api.exchange.coinbase.com"
 
 FEE_PER_SIDE = 0.001
 SLIPPAGE_PER_SIDE = 0.0015
@@ -35,8 +40,14 @@ SLIPPAGE_PER_SIDE = 0.0015
 START_BALANCE = 200.0
 RISK_DOLLARS = 2.0
 
+DEFAULT_PAIRS = {
+    "coinbase": "BTC-USD,ETH-USD,SOL-USD",
+    "kraken": "XBTUSD,ETHUSD,SOLUSD",
+}
+
 
 def fetch_ohlc(pair, interval=15):
+    """Kraken: max 720 most recent candles."""
     url = f"{KRAKEN_URL}/OHLC"
 
     response = requests.get(
@@ -77,6 +88,69 @@ def fetch_ohlc(pair, interval=15):
 
     return (
         df.dropna(
+            subset=["open", "high", "low", "close", "volume"]
+        )
+        .reset_index(drop=True)
+    )
+
+
+def fetch_coinbase(product, days=60, granularity=900):
+    """Coinbase: paginated history, 300 candles max per request."""
+    end = pd.Timestamp.now(tz="UTC").floor("15min")
+    cur = end - pd.Timedelta(days=days)
+    step = pd.Timedelta(seconds=granularity * 290)
+    frames = []
+
+    while cur < end:
+        nxt = min(cur + step, end)
+
+        response = requests.get(
+            f"{COINBASE_URL}/products/{product}/candles",
+            params={
+                "granularity": granularity,
+                "start": cur.isoformat(),
+                "end": nxt.isoformat(),
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        rows = response.json()
+
+        if rows:
+            frames.append(pd.DataFrame(
+                rows,
+                columns=[
+                    "time", "low", "high",
+                    "open", "close", "volume",
+                ],
+            ))
+
+        cur = nxt
+        time.sleep(0.4)
+
+    if not frames:
+        raise RuntimeError(f"No candles returned for {product}")
+
+    df = pd.concat(frames, ignore_index=True)
+
+    df["time"] = pd.to_datetime(
+        df["time"], unit="s", utc=True
+    )
+
+    for column in [
+        "open", "high", "low", "close", "volume"
+    ]:
+        df[column] = pd.to_numeric(
+            df[column], errors="coerce"
+        )
+
+    return (
+        df.drop_duplicates("time")
+        .sort_values("time")
+        # Drop any still-forming candle.
+        .loc[lambda d: d["time"] < end]
+        .dropna(
             subset=["open", "high", "low", "close", "volume"]
         )
         .reset_index(drop=True)
@@ -152,6 +226,54 @@ def diagnose(data, cfg, start):
     return stats
 
 
+def setup_funnel(data, cfg, start):
+    """
+    For each bar with a sequential setup, record the FIRST filter
+    that rejects it. Returns (passed_all_filters, blocked_by_counts).
+    """
+    blocked = Counter()
+    passed = 0
+
+    for i in range(start, len(data) - 2):
+
+        if _sequential_setup(data, i, cfg) is None:
+            continue
+
+        row = data.iloc[i]
+        atr = row["atr"]
+
+        checks = [
+            ("ema", row["ema_fast"] > row["ema_slow"]),
+            (
+                "above_200",
+                (not cfg.trend_period)
+                or row["close"] > row["ema_trend"],
+            ),
+            (
+                "rsi",
+                cfg.rsi_low <= row["rsi"] <= cfg.rsi_high,
+            ),
+            ("volume", row["vol_ratio"] >= cfg.min_vol_ratio),
+            (
+                "signal_bar",
+                atr > 0
+                and row["high"] - row["low"]
+                <= cfg.max_signal_bar_atr * atr,
+            ),
+        ]
+
+        failed = next(
+            (name for name, ok in checks if not ok), None
+        )
+
+        if failed:
+            blocked[failed] += 1
+        else:
+            passed += 1
+
+    return passed, dict(blocked)
+
+
 def run_backtest(df, cfg, starting_balance=START_BALANCE):
 
     data = add_indicators(df, cfg)
@@ -162,6 +284,11 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE):
     start = max(cfg.trend_period or cfg.slow, 220)
 
     diagnostics = diagnose(data, cfg, start)
+
+    print(
+        "SETUP FUNNEL (passed, blocked_by):",
+        setup_funnel(data, cfg, start),
+    )
 
     i = start
 
@@ -357,8 +484,22 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
+        "--source",
+        choices=["coinbase", "kraken"],
+        default="coinbase",
+    )
+
+    parser.add_argument(
         "--pairs",
-        default="XBTUSD,ETHUSD,SOLUSD"
+        default=None,
+        help="Comma-separated. Defaults depend on --source.",
+    )
+
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=60,
+        help="History length (coinbase only).",
     )
 
     parser.add_argument(
@@ -374,24 +515,33 @@ def main():
 
     args = parser.parse_args()
 
+    pairs_arg = args.pairs or DEFAULT_PAIRS[args.source]
+
     cfg = SignalConfig()
 
     all_trades = []
 
     for pair in [
         x.strip()
-        for x in args.pairs.split(",")
+        for x in pairs_arg.split(",")
         if x.strip()
     ]:
 
         try:
 
             print(
-                f"\nDownloading {pair} "
-                f"{args.interval}m candles..."
+                f"\nDownloading {pair} {args.interval}m "
+                f"candles from {args.source}..."
             )
 
-            df = fetch_ohlc(pair, args.interval)
+            if args.source == "coinbase":
+                df = fetch_coinbase(
+                    pair,
+                    days=args.days,
+                    granularity=args.interval * 60,
+                )
+            else:
+                df = fetch_ohlc(pair, args.interval)
 
             print(f"Completed candles received: {len(df)}")
 
@@ -442,7 +592,7 @@ def main():
 
         print(
             "\nNo completed trades. "
-            "Check ENTRY DIAGNOSTICS above."
+            "Check ENTRY DIAGNOSTICS and SETUP FUNNEL above."
         )
 
 
