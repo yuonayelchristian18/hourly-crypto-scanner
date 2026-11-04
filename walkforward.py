@@ -1,11 +1,10 @@
 """
 walkforward.py — 1h (or 15m) historical trading simulation.
 
-Reports individual entry filters plus a setup funnel so we can
-identify why trades are or are not being generated.
-
 Uses closed candles, next-candle entries, stop/target execution,
-fees, slippage and a $200 starting balance.
+fees, slippage and a $200 starting balance. Prints a train/test split
+(first 70% vs last 30% of trades by entry time) so results can be
+sanity-checked out of sample.
 
 DATA SOURCES:
 - coinbase (default): paginated history, any number of days.
@@ -13,6 +12,7 @@ DATA SOURCES:
 
 IMPORTANT:
 - This tests single-timeframe signals only, not the scanner's multi-timeframe filters.
+- Keep settings fixed after looking at the TEST result, or the split means nothing.
 - No live orders are placed.
 """
 
@@ -39,6 +39,7 @@ SLIPPAGE_PER_SIDE = 0.0015
 
 START_BALANCE = 200.0
 RISK_DOLLARS = 2.0
+TRAIN_FRACTION = 0.7
 
 DEFAULT_PAIRS = {
     "coinbase": "BTC-USD,ETH-USD,SOL-USD",
@@ -48,14 +49,11 @@ DEFAULT_PAIRS = {
 
 def fetch_ohlc(pair, interval=15):
     """Kraken: max 720 most recent candles."""
-    url = f"{KRAKEN_URL}/OHLC"
-
     response = requests.get(
-        url,
+        f"{KRAKEN_URL}/OHLC",
         params={"pair": pair, "interval": interval},
         timeout=30,
     )
-
     response.raise_for_status()
     body = response.json()
 
@@ -68,28 +66,16 @@ def fetch_ohlc(pair, interval=15):
     # Exclude the currently forming candle.
     rows = result[key][:-1]
 
-    columns = [
-        "time", "open", "high", "low",
-        "close", "vwap", "volume", "count"
-    ]
-
+    columns = ["time", "open", "high", "low", "close", "vwap", "volume", "count"]
     df = pd.DataFrame(rows, columns=columns)
 
-    for column in [
-        "open", "high", "low", "close", "volume"
-    ]:
-        df[column] = pd.to_numeric(
-            df[column], errors="coerce"
-        )
+    for column in ["open", "high", "low", "close", "volume"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    df["time"] = pd.to_datetime(
-        df["time"], unit="s", utc=True
-    )
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
     return (
-        df.dropna(
-            subset=["open", "high", "low", "close", "volume"]
-        )
+        df.dropna(subset=["open", "high", "low", "close", "volume"])
         .reset_index(drop=True)
     )
 
@@ -114,16 +100,12 @@ def fetch_coinbase(product, days=365, granularity=3600):
             timeout=30,
         )
         response.raise_for_status()
-
         rows = response.json()
 
         if rows:
             frames.append(pd.DataFrame(
                 rows,
-                columns=[
-                    "time", "low", "high",
-                    "open", "close", "volume",
-                ],
+                columns=["time", "low", "high", "open", "close", "volume"],
             ))
 
         cur = nxt
@@ -133,26 +115,17 @@ def fetch_coinbase(product, days=365, granularity=3600):
         raise RuntimeError(f"No candles returned for {product}")
 
     df = pd.concat(frames, ignore_index=True)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
-    df["time"] = pd.to_datetime(
-        df["time"], unit="s", utc=True
-    )
-
-    for column in [
-        "open", "high", "low", "close", "volume"
-    ]:
-        df[column] = pd.to_numeric(
-            df[column], errors="coerce"
-        )
+    for column in ["open", "high", "low", "close", "volume"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
     return (
         df.drop_duplicates("time")
         .sort_values("time")
         # Drop any still-forming candle.
         .loc[lambda d: d["time"] < end]
-        .dropna(
-            subset=["open", "high", "low", "close", "volume"]
-        )
+        .dropna(subset=["open", "high", "low", "close", "volume"])
         .reset_index(drop=True)
     )
 
@@ -162,7 +135,6 @@ def diagnose(data, cfg, start):
     Count individual filters and complete BUY signals.
     Individual filter counts are not necessarily simultaneous.
     """
-
     stats = {
         "candles_checked": 0,
         "sequential_setups": 0,
@@ -175,13 +147,10 @@ def diagnose(data, cfg, start):
     }
 
     for i in range(start, len(data) - 2):
-
         stats["candles_checked"] += 1
         row = data.iloc[i]
 
-        setup = _sequential_setup(data, i, cfg)
-
-        if setup is not None:
+        if _sequential_setup(data, i, cfg) is not None:
             stats["sequential_setups"] += 1
 
         if (
@@ -198,25 +167,17 @@ def diagnose(data, cfg, start):
         ):
             stats["above_200_ema"] += 1
 
-        if (
-            pd.notna(row["rsi"])
-            and cfg.rsi_low <= row["rsi"] <= cfg.rsi_high
-        ):
+        if pd.notna(row["rsi"]) and cfg.rsi_low <= row["rsi"] <= cfg.rsi_high:
             stats["rsi_in_range"] += 1
 
-        if (
-            pd.notna(row["vol_ratio"])
-            and row["vol_ratio"] >= cfg.min_vol_ratio
-        ):
+        if pd.notna(row["vol_ratio"]) and row["vol_ratio"] >= cfg.min_vol_ratio:
             stats["volume_pass"] += 1
 
         atr = row["atr"]
-
         if (
             pd.notna(atr)
             and atr > 0
-            and row["high"] - row["low"]
-            <= cfg.max_signal_bar_atr * atr
+            and row["high"] - row["low"] <= cfg.max_signal_bar_atr * atr
         ):
             stats["signal_bar_pass"] += 1
 
@@ -235,7 +196,6 @@ def setup_funnel(data, cfg, start):
     passed = 0
 
     for i in range(start, len(data) - 2):
-
         if _sequential_setup(data, i, cfg) is None:
             continue
 
@@ -244,27 +204,16 @@ def setup_funnel(data, cfg, start):
 
         checks = [
             ("ema", row["ema_fast"] > row["ema_slow"]),
-            (
-                "above_200",
-                (not cfg.trend_period)
-                or row["close"] > row["ema_trend"],
-            ),
-            (
-                "rsi",
-                cfg.rsi_low <= row["rsi"] <= cfg.rsi_high,
-            ),
+            ("above_200", (not cfg.trend_period) or row["close"] > row["ema_trend"]),
+            ("rsi", cfg.rsi_low <= row["rsi"] <= cfg.rsi_high),
             ("volume", row["vol_ratio"] >= cfg.min_vol_ratio),
             (
                 "signal_bar",
-                atr > 0
-                and row["high"] - row["low"]
-                <= cfg.max_signal_bar_atr * atr,
+                atr > 0 and row["high"] - row["low"] <= cfg.max_signal_bar_atr * atr,
             ),
         ]
 
-        failed = next(
-            (name for name, ok in checks if not ok), None
-        )
+        failed = next((name for name, ok in checks if not ok), None)
 
         if failed:
             blocked[failed] += 1
@@ -274,8 +223,7 @@ def setup_funnel(data, cfg, start):
     return passed, dict(blocked)
 
 
-def run_backtest(df, cfg, starting_balance=START_BALANCE):
-
+def run_backtest(df, cfg, starting_balance=START_BALANCE, show_diagnostics=False):
     data = add_indicators(df, cfg)
 
     balance = float(starting_balance)
@@ -283,31 +231,23 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE):
 
     start = max(cfg.trend_period or cfg.slow, 220)
 
-    diagnostics = diagnose(data, cfg, start)
-
-    print(
-        "SETUP FUNNEL (passed, blocked_by):",
-        setup_funnel(data, cfg, start),
-    )
+    diagnostics = {}
+    if show_diagnostics:
+        diagnostics = diagnose(data, cfg, start)
+        print("SETUP FUNNEL (passed, blocked_by):", setup_funnel(data, cfg, start))
 
     i = start
 
     while i < len(data) - 2:
-
         if signal_at(data, i, cfg) != BUY:
             i += 1
             continue
 
         # Signal on closed candle; enter next candle.
         entry_i = i + 1
-
-        entry = (
-            float(data.iloc[entry_i]["open"])
-            * (1 + SLIPPAGE_PER_SIDE)
-        )
+        entry = float(data.iloc[entry_i]["open"]) * (1 + SLIPPAGE_PER_SIDE)
 
         setup = _sequential_setup(data, i, cfg)
-
         if setup is None:
             i += 1
             continue
@@ -316,10 +256,7 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE):
         sweep_low = float(setup["sweep_low"])
 
         stop = (
-            min(
-                sweep_low,
-                entry - cfg.atr_stop_mult * atr
-            )
+            min(sweep_low, entry - cfg.atr_stop_mult * atr)
             - cfg.stop_buffer_atr * atr
         )
 
@@ -327,56 +264,43 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE):
             i += 1
             continue
 
-        risk_per_unit = (
-            (entry - stop)
-            + entry * 2 * (
-                FEE_PER_SIDE + SLIPPAGE_PER_SIDE
-            )
-        )
-
+        risk_per_unit = (entry - stop) + entry * 2 * (FEE_PER_SIDE + SLIPPAGE_PER_SIDE)
         if risk_per_unit <= 0:
             i += 1
             continue
 
-        # Limit position size to $2 planned risk and available cash.
+        # Limit position size to planned risk and available cash.
         risk_qty = RISK_DOLLARS / risk_per_unit
-
-        cash_qty = balance / (
-            entry * (1 + FEE_PER_SIDE)
-        )
-
+        cash_qty = balance / (entry * (1 + FEE_PER_SIDE))
         qty = min(risk_qty, cash_qty)
 
         if qty <= 0:
             i += 1
             continue
 
-        target = (
-            entry
-            + cfg.reward_risk * (entry - stop)
-        )
+        target = entry + cfg.reward_risk * (entry - stop)
 
         exit_price = None
         outcome = "OPEN"
         exit_i = None
 
         for j in range(entry_i, len(data)):
-
             candle = data.iloc[j]
+            candle_open = float(candle["open"])
 
             hit_stop = float(candle["low"]) <= stop
             hit_target = float(candle["high"]) >= target
 
-            # If both are touched in one candle,
-            # assume the stop was hit first.
+            # Gap-aware stops: if a candle opens below the stop, the fill
+            # is at the open, not at the stop price.
             if hit_stop and hit_target:
-                exit_price = stop
+                exit_price = min(stop, candle_open)
                 outcome = "STOP_BOTH_TOUCHED"
                 exit_i = j
                 break
 
             if hit_stop:
-                exit_price = stop
+                exit_price = min(stop, candle_open)
                 outcome = "STOP"
                 exit_i = j
                 break
@@ -391,18 +315,10 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE):
             # Incomplete trade is not counted.
             break
 
-        exit_fill = (
-            exit_price * (1 - SLIPPAGE_PER_SIDE)
-        )
-
+        exit_fill = exit_price * (1 - SLIPPAGE_PER_SIDE)
         gross = (exit_fill - entry) * qty
-
-        fees = (
-            entry * qty + exit_fill * qty
-        ) * FEE_PER_SIDE
-
+        fees = (entry * qty + exit_fill * qty) * FEE_PER_SIDE
         net = gross - fees
-
         balance += net
 
         trades.append({
@@ -425,7 +341,6 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE):
     results = pd.DataFrame(trades)
 
     if results.empty:
-
         summary = {
             "trades": 0,
             "win_rate": 0.0,
@@ -434,167 +349,108 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE):
             "ending_balance": round(balance, 2),
             "max_drawdown_pct": 0.0,
         }
-
         return results, summary, diagnostics
 
-    wins = results.loc[
-        results["net_pnl"] > 0, "net_pnl"
-    ].sum()
+    wins = results.loc[results["net_pnl"] > 0, "net_pnl"].sum()
+    losses = abs(results.loc[results["net_pnl"] < 0, "net_pnl"].sum())
 
-    losses = abs(
-        results.loc[
-            results["net_pnl"] < 0, "net_pnl"
-        ].sum()
-    )
-
-    equity = pd.Series(
-        [starting_balance] + results["balance"].tolist()
-    )
-
+    equity = pd.Series([starting_balance] + results["balance"].tolist())
     peak = equity.cummax()
-
-    drawdown = (
-        (peak - equity) / peak
-    ).max() * 100
+    drawdown = ((peak - equity) / peak).max() * 100
 
     summary = {
         "trades": int(len(results)),
-        "win_rate": round(
-            (results["net_pnl"] > 0).mean() * 100, 2
-        ),
-        "net_pnl": round(
-            float(results["net_pnl"].sum()), 2
-        ),
-        "profit_factor": (
-            round(float(wins / losses), 3)
-            if losses > 0 else float("inf")
-        ),
+        "win_rate": round(float((results["net_pnl"] > 0).mean() * 100), 2),
+        "net_pnl": round(float(results["net_pnl"].sum()), 2),
+        "profit_factor": round(float(wins / losses), 3) if losses > 0 else float("inf"),
         "ending_balance": round(float(balance), 2),
         "max_drawdown_pct": round(float(drawdown), 2),
-        "average_net_trade": round(
-            float(results["net_pnl"].mean()), 3
-        ),
+        "average_net_trade": round(float(results["net_pnl"].mean()), 3),
     }
 
     return results, summary, diagnostics
 
 
+def summarize(t):
+    """Compact stats for a set of trades (used for train/test split)."""
+    if t.empty:
+        return {"trades": 0}
+    w = t.loc[t["net_pnl"] > 0, "net_pnl"].sum()
+    l = abs(t.loc[t["net_pnl"] < 0, "net_pnl"].sum())
+    return {
+        "trades": int(len(t)),
+        "win_rate": round(float((t["net_pnl"] > 0).mean() * 100), 1),
+        "net_R": round(float(t["R_multiple"].sum()), 2),
+        "profit_factor": round(float(w / l), 2) if l > 0 else float("inf"),
+    }
+
+
 def main():
-
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--source",
-        choices=["coinbase", "kraken"],
-        default="coinbase",
-    )
-
-    parser.add_argument(
-        "--pairs",
-        default=None,
-        help="Comma-separated. Defaults depend on --source.",
-    )
-
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=365,
-        help="History length (coinbase only).",
-    )
-
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=60,
-        help="Candle minutes: 15 or 60 (1h).",
-    )
-
-    parser.add_argument(
-        "--csv",
-        default="walkforward_trades.csv"
-    )
-
+    parser.add_argument("--source", choices=["coinbase", "kraken"], default="coinbase")
+    parser.add_argument("--pairs", default=None,
+                        help="Comma-separated. Defaults depend on --source.")
+    parser.add_argument("--days", type=int, default=365,
+                        help="History length (coinbase only).")
+    parser.add_argument("--interval", type=int, default=60,
+                        help="Candle minutes: 15 or 60 (1h).")
+    parser.add_argument("--csv", default="walkforward_trades.csv")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Print setup funnel and filter counts (slower).")
     args = parser.parse_args()
 
     pairs_arg = args.pairs or DEFAULT_PAIRS[args.source]
-
     cfg = SignalConfig()
-
     all_trades = []
 
-    for pair in [
-        x.strip()
-        for x in pairs_arg.split(",")
-        if x.strip()
-    ]:
-
+    for pair in [x.strip() for x in pairs_arg.split(",") if x.strip()]:
         try:
-
-            print(
-                f"\nDownloading {pair} {args.interval}m "
-                f"candles from {args.source}..."
-            )
+            print(f"\nDownloading {pair} {args.interval}m candles from {args.source}...")
 
             if args.source == "coinbase":
-                df = fetch_coinbase(
-                    pair,
-                    days=args.days,
-                    granularity=args.interval * 60,
-                )
+                df = fetch_coinbase(pair, days=args.days, granularity=args.interval * 60)
             else:
                 df = fetch_ohlc(pair, args.interval)
 
             print(f"Completed candles received: {len(df)}")
 
             if len(df) < 250:
-                print(
-                    f"{pair}: insufficient history "
-                    f"({len(df)} candles)"
-                )
+                print(f"{pair}: insufficient history ({len(df)} candles)")
                 continue
 
             trades, summary, diagnostics = run_backtest(
-                df, cfg
+                df, cfg, show_diagnostics=args.diagnose
             )
 
-            print("\nENTRY DIAGNOSTICS")
-
-            for name, value in diagnostics.items():
-                print(f"{name}: {value}")
+            if args.diagnose:
+                print("\nENTRY DIAGNOSTICS")
+                for name, value in diagnostics.items():
+                    print(f"{name}: {value}")
 
             print("\nBACKTEST RESULTS")
             print(summary)
 
             if not trades.empty:
-
                 trades.insert(0, "pair", pair)
                 all_trades.append(trades)
 
         except Exception as exc:
-
             print(f"{pair}: ERROR: {exc}")
 
         time.sleep(1)
 
     if all_trades:
-
-        combined = pd.concat(
-            all_trades,
-            ignore_index=True
-        )
-
+        combined = pd.concat(all_trades, ignore_index=True)
         combined.to_csv(args.csv, index=False)
+        print(f"\nSaved {len(combined)} trades to {args.csv}")
 
-        print(
-            f"\nSaved {len(combined)} trades to {args.csv}"
-        )
-
+        print("\nALL TRADES:", summarize(combined))
+        t0, t1 = combined["entry_time"].min(), combined["entry_time"].max()
+        cut = t0 + TRAIN_FRACTION * (t1 - t0)
+        print("TRAIN (first 70%):", summarize(combined[combined["entry_time"] <= cut]))
+        print("TEST  (last 30%): ", summarize(combined[combined["entry_time"] > cut]))
     else:
-
-        print(
-            "\nNo completed trades. "
-            "Check ENTRY DIAGNOSTICS and SETUP FUNNEL above."
-        )
+        print("\nNo completed trades. Re-run with --diagnose to see where setups are blocked.")
 
 
 if __name__ == "__main__":
