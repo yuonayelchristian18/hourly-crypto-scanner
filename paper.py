@@ -94,7 +94,7 @@ def find_entries(session, base, universe, binance_symbols, cfg, args, held):
             continue
         seen.add(symbol)
         try:
-            df = add_indicators(sc.get_candles(session, base, symbol, 400), cfg)
+            df = add_indicators(sc.get_candles(session, base, symbol, 700), cfg)
             if len(df) < 200:
                 continue
             live = latest_signal(df, cfg)
@@ -141,6 +141,7 @@ def main():
     state = load_state()
     session = sc.make_session()
     base, binance_symbols = sc.pick_binance(session)
+    sc.KRAKEN_PAIRS.update(binance_symbols)
 
     last_prices = manage_open(session, base, state, cfg)
 
