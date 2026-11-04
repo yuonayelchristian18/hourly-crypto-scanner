@@ -1,5 +1,5 @@
 """
-walkforward.py — 15m historical trading simulation.
+walkforward.py — 1h (or 15m) historical trading simulation.
 
 Reports individual entry filters plus a setup funnel so we can
 identify why trades are or are not being generated.
@@ -12,7 +12,7 @@ DATA SOURCES:
 - kraken: at most 720 recent candles (API limit, cannot page back).
 
 IMPORTANT:
-- This tests 15m signals only, not the scanner's 5m/1h/4h filters.
+- This tests single-timeframe signals only, not the scanner's multi-timeframe filters.
 - No live orders are placed.
 """
 
@@ -94,9 +94,9 @@ def fetch_ohlc(pair, interval=15):
     )
 
 
-def fetch_coinbase(product, days=60, granularity=900):
+def fetch_coinbase(product, days=365, granularity=3600):
     """Coinbase: paginated history, 300 candles max per request."""
-    end = pd.Timestamp.now(tz="UTC").floor("15min")
+    end = pd.Timestamp.now(tz="UTC").floor(f"{granularity // 60}min")
     cur = end - pd.Timedelta(days=days)
     step = pd.Timedelta(seconds=granularity * 290)
     frames = []
@@ -498,14 +498,15 @@ def main():
     parser.add_argument(
         "--days",
         type=int,
-        default=60,
+        default=365,
         help="History length (coinbase only).",
     )
 
     parser.add_argument(
         "--interval",
         type=int,
-        default=15
+        default=60,
+        help="Candle minutes: 15 or 60 (1h).",
     )
 
     parser.add_argument(
