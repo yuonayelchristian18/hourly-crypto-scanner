@@ -1,199 +1,99 @@
-"""Walk-forward test: tune on older data, judge ONLY on newer data.
-
-For each coin the history is cut into rolling folds. In every fold the best
-settings are chosen using the training window, then applied to the unseen
-test window that follows. Only the test windows count toward the results.
-
-Needs scanner.py and signals.py in the same folder. Takes a few minutes.
-Kraken gives only ~30 days of hourly data, so treat results as a rough
-screen, not proof.
-
-Usage:
-    python walkforward.py
-    python walkforward.py --max-coins 8 --train 400 --test 160
-"""
-
-import argparse
-import csv
-import itertools
+import sys
 import time
 
+import numpy as np
 import pandas as pd
+import requests
 
-import scanner as sc
-from signals import SignalConfig, add_indicators
-
-MIN_TRAIN_TRADES = 3
-
-
-def get_history(session, base, symbol, total):
-    """Kraken returns at most 720 hourly candles per request (about 30 days).
-
-    The extra paging Binance allowed is not available, so `total` is capped.
-    """
-    return sc.get_candles(session, base, symbol, min(total, sc.MAX_CANDLES) + 1)
+API = "https://api.coingecko.com/api/v3"
+CATEGORIES = ["artificial-intelligence", "meme-token"]
+MAX_PRICE = 1.0
+MAX_COINS = 15
+ALERT_SCORE = 70
+HORIZON = 24  # hours ahead to measure the result
 
 
-def build_grid():
-    grid = []
-    for (fast, slow), (lo, hi), trend in itertools.product(
-        [(5, 13), (9, 21), (12, 26)], [(50, 65), (45, 70)], [None, 100]
-    ):
-        grid.append(SignalConfig(
-            fast=fast, slow=slow, rsi_low=lo, rsi_high=hi,
-            trend_period=trend, min_vol_ratio=1.0 if trend else 0.0,
-        ))
-    return grid
-
-
-def run_slice(raw, start, end, cfg):
-    """Backtest cfg over raw[start:end], with warmup taken from earlier rows."""
-    warm = max(cfg.trend_period or 0, cfg.slow, cfg.rsi_period, cfg.vol_period) + 2
-    lo = max(0, start - warm)
-    df = add_indicators(raw.iloc[lo:end].reset_index(drop=True), cfg)
-    return sc.backtest(df, cfg)
-
-
-def describe(cfg):
-    trend = f"trend{cfg.trend_period}" if cfg.trend_period else "no-trend"
-    return f"EMA{cfg.fast}/{cfg.slow} RSI{cfg.rsi_low:.0f}-{cfg.rsi_high:.0f} {trend}"
-
-
-def walk_forward(raw, train, test, grid, default_cfg):
-    folds, start = [], train
-    while start + test <= len(raw):
-        best = None
-        for cfg in grid:
-            result = run_slice(raw, start - train, start, cfg)
-            if result["trades"] < MIN_TRAIN_TRADES:
-                continue
-            if best is None or result["profit"] > best[1]["profit"]:
-                best = (cfg, result)
-
-        baseline = run_slice(raw, start, start + test, default_cfg)
-        fold = {
-            "default_ret": baseline["profit"] / sc.STARTING_BALANCE,
-            "bh": baseline["buy_hold"],
-            "tuned_ret": 0.0,      # no qualifying settings = stay in cash
-            "trades": 0,
-            "settings": "none (stayed flat)",
-        }
-        if best is not None:
-            oos = run_slice(raw, start, start + test, best[0])
-            fold.update(
-                tuned_ret=oos["profit"] / sc.STARTING_BALANCE,
-                trades=oos["trades"],
-                settings=describe(best[0]),
+def get(path, params=None, retries=4):
+    for i in range(retries):
+        try:
+            r = requests.get(
+                f"{API}{path}",
+                params=params,
+                timeout=30,
+                headers={"User-Agent": "crypto-scanner"},
             )
-        folds.append(fold)
-        start += test
-    return folds
+            if r.status_code == 429:
+                print("rate limited, waiting...")
+                time.sleep(20 * (i + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            print(f"request failed ({path}): {e}")
+            time.sleep(5 * (i + 1))
+    return None
 
 
-def compound(returns):
-    total = 1.0
-    for r in returns:
-        total *= 1 + r
-    return total - 1
+def pick_coins():
+    coins = {}
+    for cat in CATEGORIES:
+        data = get(
+            "/coins/markets",
+            {
+                "vs_currency": "usd",
+                "category": cat,
+                "order": "volume_desc",
+                "per_page": 100,
+                "page": 1,
+            },
+        )
+        if not data:
+            continue
+        for c in data:
+            price = c.get("current_price")
+            if price is not None and price < MAX_PRICE:
+                coins[c["id"]] = c["symbol"].upper()
+        time.sleep(3)
+    return list(coins.items())[:MAX_COINS]
+
+
+def history(coin_id):
+    d = get(f"/coins/{coin_id}/market_chart", {"vs_currency": "usd", "days": 90})
+    if not d or not d.get("prices"):
+        return None
+    n = min(len(d["prices"]), len(d["total_volumes"]))
+    df = pd.DataFrame(
+        {
+            "ts": [x[0] for x in d["prices"][:n]],
+            "price": [x[1] for x in d["prices"][:n]],
+            "volume": [x[1] for x in d["total_volumes"][:n]],
+        }
+    )
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+    return df.set_index("ts")
+
+
+def add_score(df):
+    p = df["price"]
+    mom = p.pct_change(24)
+    mom_rank = mom.rolling(24 * 30, min_periods=24 * 7).rank(pct=True)
+    vol_ratio = df["volume"] / df["volume"].rolling(24 * 7, min_periods=24).mean()
+    vol_rank = vol_ratio.rolling(24 * 30, min_periods=24 * 7).rank(pct=True)
+    trend = (p > p.rolling(24 * 7, min_periods=24).mean()).astype(float)
+    df["score"] = 50 * mom_rank + 30 * vol_rank + 20 * trend
+    df["fwd"] = p.shift(-HORIZON) / p - 1
+    return df
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--categories", default=sc.DEFAULT_CATEGORIES)
-    parser.add_argument("--max-coins", type=int, default=12)
-    parser.add_argument("--bars", type=int, default=720, help="hourly candles per coin (Kraken max 720)")
-    parser.add_argument("--train", type=int, default=400)
-    parser.add_argument("--test", type=int, default=160)
-    parser.add_argument("--csv", default="walkforward_results.csv")
-    args = parser.parse_args()
+    coins = pick_coins()
+    if not coins:
+        sys.exit("No coins returned from CoinGecko. See request errors above.")
+    print(f"Testing {len(coins)} coins: {', '.join(s for _, s in coins)}")
 
-    session = sc.make_session()
-    categories = [c.strip() for c in args.categories.split(",") if c.strip()]
-    universe = sc.get_universe(session, categories, 100, 1.0, 1_000_000, 20_000_000)
-    base, binance_symbols = sc.pick_binance(session)
-    sc.KRAKEN_PAIRS.update(binance_symbols)
-
-    grid, default_cfg = build_grid(), SignalConfig()
-    print(f"{len(universe)} candidate coins, {len(grid)} setting combinations, "
-          f"train {args.train} / test {args.test} bars\n")
-
-    rows, seen, all_folds = [], set(), []
-
-    for coin in universe:
-        if len(rows) >= args.max_coins:
-            break
-        name = coin["symbol"].upper()
-        symbol = name + "USDT"
-        if name in sc.STABLES or symbol in seen or symbol not in binance_symbols:
-            continue
-        seen.add(symbol)
-
-        try:
-            raw = get_history(session, base, symbol, args.bars)
-            if len(raw) < args.train + args.test:
-                print(f"{symbol}: only {len(raw)} candles, skipped")
-                continue
-
-            gap = abs(float(raw.iloc[-1]["close"]) / coin["current_price"] - 1)
-            if gap > sc.PRICE_TOLERANCE:
-                print(f"{symbol}: ticker clash suspected ({gap * 100:.0f}% price gap), skipped")
-                continue
-
-            folds = walk_forward(raw, args.train, args.test, grid, default_cfg)
-            all_folds.extend(folds)
-
-            row = {
-                "symbol": symbol,
-                "folds": len(folds),
-                "tuned_oos": compound(f["tuned_ret"] for f in folds),
-                "default_oos": compound(f["default_ret"] for f in folds),
-                "buy_hold": compound(f["bh"] for f in folds),
-                "beat_bh": sum(f["tuned_ret"] > f["bh"] for f in folds),
-                "trades": sum(f["trades"] for f in folds),
-            }
-            rows.append(row)
-            print(f"{symbol:<12} folds {row['folds']}  "
-                  f"tuned {row['tuned_oos'] * 100:>7.1f}%  "
-                  f"default {row['default_oos'] * 100:>7.1f}%  "
-                  f"buy&hold {row['buy_hold'] * 100:>7.1f}%  "
-                  f"beat B&H in {row['beat_bh']}/{row['folds']}  trades {row['trades']}")
-        except Exception as exc:
-            print(f"{symbol}: error - {exc}")
-
-    if not rows:
-        print("No results.")
-        return
-
-    n = len(rows)
-    avg = lambda key: sum(r[key] for r in rows) / n
-    total_folds = len(all_folds)
-    beat = sum(f["tuned_ret"] > f["bh"] for f in all_folds)
-    profitable = sum(f["tuned_ret"] > 0 for f in all_folds)
-    flat = sum(f["trades"] == 0 for f in all_folds)
-
-    print("\n=== OUT-OF-SAMPLE SUMMARY (test windows only) ===")
-    print(f"Coins: {n}   Folds: {total_folds}")
-    print(f"Average tuned strategy:  {avg('tuned_oos') * 100:+.1f}%")
-    print(f"Average default settings: {avg('default_oos') * 100:+.1f}%")
-    print(f"Average buy & hold:       {avg('buy_hold') * 100:+.1f}%")
-    print(f"Folds profitable: {profitable}/{total_folds}   "
-          f"beat buy & hold: {beat}/{total_folds}   no trades: {flat}/{total_folds}")
-
-    if avg("tuned_oos") > avg("buy_hold") and beat / total_folds >= 0.6:
-        print("Verdict: some evidence of an edge. Confirm it with paper trading "
-              "before using real money.")
-    elif avg("tuned_oos") > 0:
-        print("Verdict: profitable but not clearly better than just holding. "
-              "Treat as unproven.")
-    else:
-        print("Verdict: no out-of-sample edge found. Do not trade this with real money.")
-
-    with open(args.csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"\nSaved {args.csv}")
-
-
-if __name__ == "__main__":
-    main()
+    frames = []
+    latest = {}
+    for cid, sym in coins:
+        df = history(cid)
+        time.sleep(7)  # stay under the free rate limit
+        if df is None or len(df) 
