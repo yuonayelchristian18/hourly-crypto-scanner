@@ -1,87 +1,99 @@
 """
-walkforward.py — 1h (or 15m) historical trading simulation.
+walkforward.py — multi-coin historical simulation of the scanner's signal logic.
 
-Uses closed candles, next-candle entries, stop/target execution,
-fees, slippage and a $200 starting balance. Prints a train/test split
-(first 70% vs last 30% of trades by entry time) so results can be
-sanity-checked out of sample.
+Running `python walkforward.py` with NO options does the big test:
+15m candles, 180 days, up to 60 Coinbase USD pairs (auto-discovered),
+downloaded in parallel, with a train/test split at the end.
 
-DATA SOURCES:
-- coinbase (default): paginated history, any number of days.
-- kraken: at most 720 recent candles (API limit, cannot page back).
+Uses closed candles, next-candle entries, gap-aware stops, fees, slippage
+and a $200 reference balance. No live orders are ever placed.
 
-IMPORTANT:
-- This tests single-timeframe signals only, not the scanner's multi-timeframe filters.
-- Keep settings fixed after looking at the TEST result, or the split means nothing.
-- No live orders are placed.
+Notes:
+- Single-timeframe test: it does NOT include the scanner's 1h/4h/5m filters.
+- Keep settings fixed after you look at the TEST result, or the split means nothing.
+- Kraken source is limited to the most recent 720 candles (API limit).
 """
 
 import argparse
+import threading
 import time
-from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
+import numpy as np
 import pandas as pd
+import requests
 
-from signals import (
-    SignalConfig,
-    add_indicators,
-    signal_at,
-    BUY,
-    _sequential_setup,
-)
+from signals import SignalConfig, add_indicators, signal_at, BUY, _sequential_setup
 
 KRAKEN_URL = "https://api.kraken.com/0/public"
 COINBASE_URL = "https://api.exchange.coinbase.com"
 
 FEE_PER_SIDE = 0.001
 SLIPPAGE_PER_SIDE = 0.0015
-
 START_BALANCE = 200.0
 RISK_DOLLARS = 2.0
 TRAIN_FRACTION = 0.7
 
-DEFAULT_PAIRS = {
-    "coinbase": "BTC-USD,ETH-USD,SOL-USD",
-    "kraken": "XBTUSD,ETHUSD,SOLUSD",
-}
+STABLES = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDS",
+           "BUSD", "USD1", "USDD", "EURC", "GUSD", "PAX", "WBTC", "CBBTC", "WETH"}
+
+# Tried first (AI / meme / liquid alts). Anything Coinbase doesn't list is skipped.
+PRIORITY = [
+    "DOGE", "SHIB", "PEPE", "BONK", "WIF", "FLOKI", "FET", "RENDER", "TAO", "NEAR",
+    "ARB", "INJ", "IMX", "LINK", "AVAX", "ADA", "XRP", "POL", "HBAR", "SUI",
+    "APT", "OP", "ATOM", "DOT", "UNI", "AAVE", "LTC", "BCH", "FIL", "ICP",
+    "ONDO", "JASMY", "GRT", "AKT", "VIRTUAL", "TRUMP", "POPCAT", "MOG", "TURBO",
+    "BTC", "ETH", "SOL",
+]
+
+_rate_lock = threading.Lock()
+_last_call = [0.0]
+MIN_INTERVAL = 0.12  # seconds between Coinbase calls across all threads
 
 
-def fetch_ohlc(pair, interval=15):
-    """Kraken: max 720 most recent candles."""
-    response = requests.get(
-        f"{KRAKEN_URL}/OHLC",
-        params={"pair": pair, "interval": interval},
-        timeout=30,
-    )
-    response.raise_for_status()
-    body = response.json()
-
-    if body.get("error"):
-        raise RuntimeError(body["error"])
-
-    result = body["result"]
-    key = next(k for k in result if k != "last")
-
-    # Exclude the currently forming candle.
-    rows = result[key][:-1]
-
-    columns = ["time", "open", "high", "low", "close", "vwap", "volume", "count"]
-    df = pd.DataFrame(rows, columns=columns)
-
-    for column in ["open", "high", "low", "close", "volume"]:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
-
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-
-    return (
-        df.dropna(subset=["open", "high", "low", "close", "volume"])
-        .reset_index(drop=True)
-    )
+def get_json(url, params=None, retries=6):
+    """GET with global rate limiting and retry/backoff on 429/5xx/network errors."""
+    delay = 1.0
+    for attempt in range(retries):
+        with _rate_lock:
+            wait = MIN_INTERVAL - (time.time() - _last_call[0])
+            if wait > 0:
+                time.sleep(wait)
+            _last_call[0] = time.time()
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"HTTP {r.status_code}")
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 20)
 
 
-def fetch_coinbase(product, days=365, granularity=3600):
-    """Coinbase: paginated history, 300 candles max per request."""
+def discover_pairs(max_pairs):
+    """All online Coinbase USD pairs, priority coins first, stablecoins excluded."""
+    products = get_json(f"{COINBASE_URL}/products")
+    live = {}
+    for p in products:
+        if p.get("quote_currency") != "USD":
+            continue
+        if p.get("trading_disabled") or p.get("status", "online") != "online":
+            continue
+        base = str(p.get("base_currency", "")).upper()
+        if not base or base in STABLES:
+            continue
+        live[base] = p["id"]
+
+    ordered = [live[b] for b in PRIORITY if b in live]
+    rest = sorted(pid for b, pid in live.items() if pid not in ordered)
+    return (ordered + rest)[:max_pairs]
+
+
+def fetch_coinbase(product, days=180, granularity=900):
+    """Paginated Coinbase history, 300 candles max per request."""
     end = pd.Timestamp.now(tz="UTC").floor(f"{granularity // 60}min")
     cur = end - pd.Timedelta(days=days)
     step = pd.Timedelta(seconds=granularity * 290)
@@ -89,177 +101,96 @@ def fetch_coinbase(product, days=365, granularity=3600):
 
     while cur < end:
         nxt = min(cur + step, end)
-
-        response = requests.get(
+        rows = get_json(
             f"{COINBASE_URL}/products/{product}/candles",
-            params={
-                "granularity": granularity,
-                "start": cur.isoformat(),
-                "end": nxt.isoformat(),
-            },
-            timeout=30,
+            params={"granularity": granularity,
+                    "start": cur.isoformat(), "end": nxt.isoformat()},
         )
-        response.raise_for_status()
-        rows = response.json()
-
         if rows:
             frames.append(pd.DataFrame(
-                rows,
-                columns=["time", "low", "high", "open", "close", "volume"],
-            ))
-
+                rows, columns=["time", "low", "high", "open", "close", "volume"]))
         cur = nxt
-        time.sleep(0.4)
 
     if not frames:
-        raise RuntimeError(f"No candles returned for {product}")
+        raise RuntimeError("no candles returned")
 
     df = pd.concat(frames, ignore_index=True)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-
-    for column in ["open", "high", "low", "close", "volume"]:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return (
-        df.drop_duplicates("time")
-        .sort_values("time")
-        # Drop any still-forming candle.
-        .loc[lambda d: d["time"] < end]
+        df.drop_duplicates("time").sort_values("time")
+        .loc[lambda d: d["time"] < end]  # drop still-forming candle
         .dropna(subset=["open", "high", "low", "close", "volume"])
         .reset_index(drop=True)
     )
 
 
-def diagnose(data, cfg, start):
+def fetch_kraken(pair, interval):
+    """Kraken: at most the 720 most recent candles."""
+    body = get_json(f"{KRAKEN_URL}/OHLC", params={"pair": pair, "interval": interval})
+    if body.get("error"):
+        raise RuntimeError(body["error"])
+    result = body["result"]
+    key = next(k for k in result if k != "last")
+    df = pd.DataFrame(result[key][:-1],
+                      columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    return df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+
+
+def candidate_mask(data, cfg):
     """
-    Count individual filters and complete BUY signals.
-    Individual filter counts are not necessarily simultaneous.
+    Cheap vectorized prefilter: only these candles can possibly be BUY signals,
+    so the slow sequential check runs on a tiny fraction of candles.
     """
-    stats = {
-        "candles_checked": 0,
-        "sequential_setups": 0,
-        "ema_fast_above_slow": 0,
-        "above_200_ema": 0,
-        "rsi_in_range": 0,
-        "volume_pass": 0,
-        "signal_bar_pass": 0,
-        "complete_buy_signals": 0,
-    }
-
-    for i in range(start, len(data) - 2):
-        stats["candles_checked"] += 1
-        row = data.iloc[i]
-
-        if _sequential_setup(data, i, cfg) is not None:
-            stats["sequential_setups"] += 1
-
-        if (
-            pd.notna(row["ema_fast"])
-            and pd.notna(row["ema_slow"])
-            and row["ema_fast"] > row["ema_slow"]
-        ):
-            stats["ema_fast_above_slow"] += 1
-
-        if (
-            cfg.trend_period
-            and pd.notna(row["ema_trend"])
-            and row["close"] > row["ema_trend"]
-        ):
-            stats["above_200_ema"] += 1
-
-        if pd.notna(row["rsi"]) and cfg.rsi_low <= row["rsi"] <= cfg.rsi_high:
-            stats["rsi_in_range"] += 1
-
-        if pd.notna(row["vol_ratio"]) and row["vol_ratio"] >= cfg.min_vol_ratio:
-            stats["volume_pass"] += 1
-
-        atr = row["atr"]
-        if (
-            pd.notna(atr)
-            and atr > 0
-            and row["high"] - row["low"] <= cfg.max_signal_bar_atr * atr
-        ):
-            stats["signal_bar_pass"] += 1
-
-        if signal_at(data, i, cfg) == BUY:
-            stats["complete_buy_signals"] += 1
-
-    return stats
+    m = (
+        (data["ema_fast"] > data["ema_slow"])
+        & data["rsi"].between(cfg.rsi_low, cfg.rsi_high)
+        & (data["vol_ratio"] >= cfg.min_vol_ratio)
+        & (data["atr"] > 0)
+        & ((data["high"] - data["low"]) <= cfg.max_signal_bar_atr * data["atr"])
+    )
+    if cfg.trend_period:
+        m &= data["close"] > data["ema_trend"]
+    return m.fillna(False).to_numpy()
 
 
-def setup_funnel(data, cfg, start):
-    """
-    For each bar with a sequential setup, record the FIRST filter
-    that rejects it. Returns (passed_all_filters, blocked_by_counts).
-    """
-    blocked = Counter()
-    passed = 0
-
-    for i in range(start, len(data) - 2):
-        if _sequential_setup(data, i, cfg) is None:
-            continue
-
-        row = data.iloc[i]
-        atr = row["atr"]
-
-        checks = [
-            ("ema", row["ema_fast"] > row["ema_slow"]),
-            ("above_200", (not cfg.trend_period) or row["close"] > row["ema_trend"]),
-            ("rsi", cfg.rsi_low <= row["rsi"] <= cfg.rsi_high),
-            ("volume", row["vol_ratio"] >= cfg.min_vol_ratio),
-            (
-                "signal_bar",
-                atr > 0 and row["high"] - row["low"] <= cfg.max_signal_bar_atr * atr,
-            ),
-        ]
-
-        failed = next((name for name, ok in checks if not ok), None)
-
-        if failed:
-            blocked[failed] += 1
-        else:
-            passed += 1
-
-    return passed, dict(blocked)
-
-
-def run_backtest(df, cfg, starting_balance=START_BALANCE, show_diagnostics=False):
+def run_backtest(df, cfg, starting_balance=START_BALANCE):
     data = add_indicators(df, cfg)
+    cand = candidate_mask(data, cfg)
+
+    opens = data["open"].to_numpy(float)
+    highs = data["high"].to_numpy(float)
+    lows = data["low"].to_numpy(float)
+    times = data["time"].to_numpy()
+    atrs = data["atr"].to_numpy(float)
 
     balance = float(starting_balance)
     trades = []
-
     start = max(cfg.trend_period or cfg.slow, 220)
-
-    diagnostics = {}
-    if show_diagnostics:
-        diagnostics = diagnose(data, cfg, start)
-        print("SETUP FUNNEL (passed, blocked_by):", setup_funnel(data, cfg, start))
-
+    n = len(data)
     i = start
 
-    while i < len(data) - 2:
-        if signal_at(data, i, cfg) != BUY:
+    while i < n - 2:
+        if not cand[i] or signal_at(data, i, cfg) != BUY:
             i += 1
             continue
 
-        # Signal on closed candle; enter next candle.
         entry_i = i + 1
-        entry = float(data.iloc[entry_i]["open"]) * (1 + SLIPPAGE_PER_SIDE)
+        entry = opens[entry_i] * (1 + SLIPPAGE_PER_SIDE)
 
         setup = _sequential_setup(data, i, cfg)
         if setup is None:
             i += 1
             continue
 
-        atr = float(data.iloc[i]["atr"])
-        sweep_low = float(setup["sweep_low"])
-
-        stop = (
-            min(sweep_low, entry - cfg.atr_stop_mult * atr)
+        atr = atrs[i]
+        stop = min(float(setup["sweep_low"]), entry - cfg.atr_stop_mult * atr) \
             - cfg.stop_buffer_atr * atr
-        )
-
         if not (0 < stop < entry):
             i += 1
             continue
@@ -269,51 +200,30 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE, show_diagnostics=False
             i += 1
             continue
 
-        # Limit position size to planned risk and available cash.
-        risk_qty = RISK_DOLLARS / risk_per_unit
-        cash_qty = balance / (entry * (1 + FEE_PER_SIDE))
-        qty = min(risk_qty, cash_qty)
-
+        qty = min(RISK_DOLLARS / risk_per_unit,
+                  balance / (entry * (1 + FEE_PER_SIDE)))
         if qty <= 0:
             i += 1
             continue
 
         target = entry + cfg.reward_risk * (entry - stop)
 
-        exit_price = None
-        outcome = "OPEN"
-        exit_i = None
-
-        for j in range(entry_i, len(data)):
-            candle = data.iloc[j]
-            candle_open = float(candle["open"])
-
-            hit_stop = float(candle["low"]) <= stop
-            hit_target = float(candle["high"]) >= target
-
-            # Gap-aware stops: if a candle opens below the stop, the fill
-            # is at the open, not at the stop price.
-            if hit_stop and hit_target:
-                exit_price = min(stop, candle_open)
-                outcome = "STOP_BOTH_TOUCHED"
-                exit_i = j
-                break
-
+        exit_price = exit_i = outcome = None
+        for j in range(entry_i, n):
+            hit_stop = lows[j] <= stop
+            hit_target = highs[j] >= target
             if hit_stop:
-                exit_price = min(stop, candle_open)
-                outcome = "STOP"
+                # Stop wins ties; gaps below the stop fill at the open.
+                exit_price = min(stop, opens[j])
+                outcome = "STOP_BOTH_TOUCHED" if hit_target else "STOP"
                 exit_i = j
                 break
-
             if hit_target:
-                exit_price = target
-                outcome = "TARGET"
-                exit_i = j
+                exit_price, outcome, exit_i = target, "TARGET", j
                 break
 
         if exit_price is None:
-            # Incomplete trade is not counted.
-            break
+            break  # trade still open at end of data; not counted
 
         exit_fill = exit_price * (1 - SLIPPAGE_PER_SIDE)
         gross = (exit_fill - entry) * qty
@@ -322,57 +232,18 @@ def run_backtest(df, cfg, starting_balance=START_BALANCE, show_diagnostics=False
         balance += net
 
         trades.append({
-            "entry_time": data.iloc[entry_i]["time"],
-            "exit_time": data.iloc[exit_i]["time"],
-            "entry": entry,
-            "stop": stop,
-            "target": target,
-            "exit": exit_fill,
-            "quantity": qty,
-            "outcome": outcome,
-            "net_pnl": net,
-            "balance": balance,
-            "R_multiple": net / RISK_DOLLARS,
+            "entry_time": pd.Timestamp(times[entry_i]),
+            "exit_time": pd.Timestamp(times[exit_i]),
+            "entry": entry, "stop": stop, "target": target, "exit": exit_fill,
+            "quantity": qty, "outcome": outcome, "net_pnl": net,
+            "balance": balance, "R_multiple": net / RISK_DOLLARS,
         })
+        i = exit_i + 1  # no overlapping trades on the same pair
 
-        # Do not overlap trades on the same pair.
-        i = exit_i + 1
-
-    results = pd.DataFrame(trades)
-
-    if results.empty:
-        summary = {
-            "trades": 0,
-            "win_rate": 0.0,
-            "net_pnl": 0.0,
-            "profit_factor": 0.0,
-            "ending_balance": round(balance, 2),
-            "max_drawdown_pct": 0.0,
-        }
-        return results, summary, diagnostics
-
-    wins = results.loc[results["net_pnl"] > 0, "net_pnl"].sum()
-    losses = abs(results.loc[results["net_pnl"] < 0, "net_pnl"].sum())
-
-    equity = pd.Series([starting_balance] + results["balance"].tolist())
-    peak = equity.cummax()
-    drawdown = ((peak - equity) / peak).max() * 100
-
-    summary = {
-        "trades": int(len(results)),
-        "win_rate": round(float((results["net_pnl"] > 0).mean() * 100), 2),
-        "net_pnl": round(float(results["net_pnl"].sum()), 2),
-        "profit_factor": round(float(wins / losses), 3) if losses > 0 else float("inf"),
-        "ending_balance": round(float(balance), 2),
-        "max_drawdown_pct": round(float(drawdown), 2),
-        "average_net_trade": round(float(results["net_pnl"].mean()), 3),
-    }
-
-    return results, summary, diagnostics
+    return pd.DataFrame(trades)
 
 
 def summarize(t):
-    """Compact stats for a set of trades (used for train/test split)."""
     if t.empty:
         return {"trades": 0}
     w = t.loc[t["net_pnl"] > 0, "net_pnl"].sum()
@@ -381,76 +252,100 @@ def summarize(t):
         "trades": int(len(t)),
         "win_rate": round(float((t["net_pnl"] > 0).mean() * 100), 1),
         "net_R": round(float(t["R_multiple"].sum()), 2),
+        "avg_R": round(float(t["R_multiple"].mean()), 3),
         "profit_factor": round(float(w / l), 2) if l > 0 else float("inf"),
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["coinbase", "kraken"], default="coinbase")
-    parser.add_argument("--pairs", default=None,
-                        help="Comma-separated. Defaults depend on --source.")
-    parser.add_argument("--days", type=int, default=365,
-                        help="History length (coinbase only).")
-    parser.add_argument("--interval", type=int, default=60,
-                        help="Candle minutes: 15 or 60 (1h).")
-    parser.add_argument("--csv", default="walkforward_trades.csv")
-    parser.add_argument("--diagnose", action="store_true",
-                        help="Print setup funnel and filter counts (slower).")
-    args = parser.parse_args()
-
-    pairs_arg = args.pairs or DEFAULT_PAIRS[args.source]
-    cfg = SignalConfig()
-    all_trades = []
-
-    for pair in [x.strip() for x in pairs_arg.split(",") if x.strip()]:
-        try:
-            print(f"\nDownloading {pair} {args.interval}m candles from {args.source}...")
-
-            if args.source == "coinbase":
-                df = fetch_coinbase(pair, days=args.days, granularity=args.interval * 60)
-            else:
-                df = fetch_ohlc(pair, args.interval)
-
-            print(f"Completed candles received: {len(df)}")
-
-            if len(df) < 250:
-                print(f"{pair}: insufficient history ({len(df)} candles)")
-                continue
-
-            trades, summary, diagnostics = run_backtest(
-                df, cfg, show_diagnostics=args.diagnose
-            )
-
-            if args.diagnose:
-                print("\nENTRY DIAGNOSTICS")
-                for name, value in diagnostics.items():
-                    print(f"{name}: {value}")
-
-            print("\nBACKTEST RESULTS")
-            print(summary)
-
-            if not trades.empty:
-                trades.insert(0, "pair", pair)
-                all_trades.append(trades)
-
-        except Exception as exc:
-            print(f"{pair}: ERROR: {exc}")
-
-        time.sleep(1)
-
-    if all_trades:
-        combined = pd.concat(all_trades, ignore_index=True)
-        combined.to_csv(args.csv, index=False)
-        print(f"\nSaved {len(combined)} trades to {args.csv}")
-
-        print("\nALL TRADES:", summarize(combined))
-        t0, t1 = combined["entry_time"].min(), combined["entry_time"].max()
-        cut = t0 + TRAIN_FRACTION * (t1 - t0)
-        print("TRAIN (first 70%):", summarize(combined[combined["entry_time"] <= cut]))
-        print("TEST  (last 30%): ", summarize(combined[combined["entry_time"] > cut]))
+def process_pair(pair, args, cfg):
+    """Download + backtest one pair. Returns (pair, trades_df, note)."""
+    if args.source == "coinbase":
+        df = fetch_coinbase(pair, days=args.days, granularity=args.interval * 60)
     else:
-        print("\nNo completed trades. Re-run with --diagnose to see where setups are blocked.")
+        df = fetch_kraken(pair, args.interval)
+
+    if len(df) < 300:
+        return pair, pd.DataFrame(), f"skipped (only {len(df)} candles)"
+    if args.max_price and float(df["close"].iloc[-1]) >= args.max_price:
+        return pair, pd.DataFrame(), f"skipped (price >= ${args.max_price})"
+
+    trades = run_backtest(df, cfg)
+    if not trades.empty:
+        trades.insert(0, "pair", pair)
+    return pair, trades, f"{len(df)} candles"
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--source", choices=["coinbase", "kraken"], default="coinbase")
+    p.add_argument("--pairs", default="auto",
+                   help="Comma-separated list, or 'auto' to discover many USD pairs.")
+    p.add_argument("--max-pairs", type=int, default=60, help="Cap for auto discovery.")
+    p.add_argument("--days", type=int, default=180, help="History length (coinbase only).")
+    p.add_argument("--interval", type=int, default=15, help="Candle minutes: 15 or 60.")
+    p.add_argument("--workers", type=int, default=4, help="Parallel downloads.")
+    p.add_argument("--max-price", type=float, default=0.0,
+                   help="Only test coins priced below this (0 = no limit). Use 1 to mimic the scanner.")
+    p.add_argument("--csv", default="walkforward_trades.csv")
+    args = p.parse_args()
+
+    if args.pairs == "auto":
+        if args.source != "coinbase":
+            p.error("--pairs auto needs --source coinbase; pass --pairs for kraken")
+        pairs = discover_pairs(args.max_pairs)
+    else:
+        pairs = [x.strip() for x in args.pairs.split(",") if x.strip()]
+
+    print(f"Testing {len(pairs)} pairs | {args.interval}m | {args.days} days | {args.source}")
+    cfg = SignalConfig()
+    all_trades, failed = [], []
+    t_start = time.time()
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {pool.submit(process_pair, pr, args, cfg): pr for pr in pairs}
+        for done, fut in enumerate(as_completed(futures), 1):
+            pr = futures[fut]
+            try:
+                pair, trades, note = fut.result()
+                print(f"[{done}/{len(pairs)}] {pair}: {len(trades)} trades ({note})", flush=True)
+                if not trades.empty:
+                    all_trades.append(trades)
+            except Exception as exc:
+                failed.append(pr)
+                print(f"[{done}/{len(pairs)}] {pr}: ERROR {exc}", flush=True)
+
+    print(f"\nFinished in {time.time() - t_start:.0f}s. Failed pairs: {len(failed)}")
+
+    if not all_trades:
+        print("No completed trades.")
+        return
+
+    combined = pd.concat(all_trades, ignore_index=True).sort_values("entry_time")
+    combined.to_csv(args.csv, index=False)
+    print(f"Saved {len(combined)} trades to {args.csv}")
+
+    print("\nPER-PAIR (sorted by net R):")
+    rows = []
+    for pair, g in combined.groupby("pair"):
+        s = summarize(g)
+        rows.append({"pair": pair, **s})
+    table = pd.DataFrame(rows).sort_values("net_R", ascending=False)
+    print(table.to_string(index=False))
+
+    total_r = combined["R_multiple"].sum()
+    best = table.iloc[0]
+    if total_r > 0 and best["net_R"] > 0.5 * total_r:
+        print(f"\nWARNING: {best['pair']} supplies over half of all profit; "
+              "the edge may rest on one coin.")
+
+    t0, t1 = combined["entry_time"].min(), combined["entry_time"].max()
+    cut = t0 + TRAIN_FRACTION * (t1 - t0)
+    print("\nALL TRADES:", summarize(combined))
+    print("TRAIN (first 70%):", summarize(combined[combined["entry_time"] <= cut]))
+    print("TEST  (last 30%): ", summarize(combined[combined["entry_time"] > cut]))
+
+    if len(combined) < 100:
+        print("\nNote: under 100 trades; treat these results as inconclusive.")
 
 
 if __name__ == "__main__":
