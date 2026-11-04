@@ -1,8 +1,7 @@
 """Indicator and signal logic for scanner.py.
 
 Pure functions only: no network calls, no printing, so everything here
-can be tested on its own. `add_indicators` and `signal_at` keep the same
-names as before, so scanner.py can import them directly.
+can be tested on its own.
 """
 
 from dataclasses import dataclass
@@ -28,11 +27,12 @@ class SignalConfig:
 
     def __post_init__(self):
         if self.fast >= self.slow:
-            raise ValueError("fast period must be shorter than slow period")
+            raise ValueError("fast period must be shorter than slow")
         if not 0 <= self.rsi_low < self.rsi_high <= 100:
             raise ValueError("RSI band must satisfy 0 <= low < high <= 100")
-        if self.trend_period is not None and self.trend_period <= self.slow:
-            raise ValueError("trend_period must be longer than slow period")
+        if self.trend_period is not None:
+            if self.trend_period <= self.slow:
+                raise ValueError("trend_period must be longer than slow")
 
 
 DEFAULT_CONFIG = SignalConfig()
@@ -62,16 +62,24 @@ def add_indicators(df, cfg=DEFAULT_CONFIG):
 
     if cfg.trend_period:
         df["ema_trend"] = close.ewm(
-            span=cfg.trend_period, adjust=False, min_periods=cfg.trend_period
+            span=cfg.trend_period,
+            adjust=False,
+            min_periods=cfg.trend_period,
         ).mean()
 
     # RSI (Wilder smoothing)
     change = close.diff()
-    avg_gain = change.clip(lower=0).ewm(
-        alpha=1 / cfg.rsi_period, min_periods=cfg.rsi_period, adjust=False
+    gains = change.clip(lower=0)
+    losses = -change.clip(upper=0)
+    avg_gain = gains.ewm(
+        alpha=1 / cfg.rsi_period,
+        min_periods=cfg.rsi_period,
+        adjust=False,
     ).mean()
-    avg_loss = (-change.clip(upper=0)).ewm(
-        alpha=1 / cfg.rsi_period, min_periods=cfg.rsi_period, adjust=False
+    avg_loss = losses.ewm(
+        alpha=1 / cfg.rsi_period,
+        min_periods=cfg.rsi_period,
+        adjust=False,
     ).mean()
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
@@ -83,18 +91,17 @@ def add_indicators(df, cfg=DEFAULT_CONFIG):
     df["vol_ratio"] = df["volume"] / avg_vol.replace(0, float("nan"))
 
     # ATR (needs high and low; skipped if they are missing)
-    if {"high", "low"}.issubset(df.columns):
+    if "high" in df.columns and "low" in df.columns:
         prev_close = close.shift(1)
-        true_range = pd.concat(
-            [
-                df["high"] - df["low"],
-                (df["high"] - prev_close).abs(),
-                (df["low"] - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
+        range_a = df["high"] - df["low"]
+        range_b = (df["high"] - prev_close).abs()
+        range_c = (df["low"] - prev_close).abs()
+        true_range = pd.concat([range_a, range_b, range_c], axis=1)
+        true_range = true_range.max(axis=1)
         df["atr"] = true_range.ewm(
-            alpha=1 / cfg.atr_period, min_periods=cfg.atr_period, adjust=False
+            alpha=1 / cfg.atr_period,
+            min_periods=cfg.atr_period,
+            adjust=False,
         ).mean()
     else:
         df["atr"] = float("nan")
@@ -107,17 +114,25 @@ def signal_at(df, i, cfg=DEFAULT_CONFIG):
     if i < 1 or i >= len(df):
         return HOLD
 
-    row, prev = df.iloc[i], df.iloc[i - 1]
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
 
-    needed = [row["ema_fast"], row["ema_slow"], prev["ema_fast"],
-              prev["ema_slow"], row["rsi"]]
+    needed = [
+        row["ema_fast"], row["ema_slow"],
+        prev["ema_fast"], prev["ema_slow"],
+        row["rsi"],
+    ]
     if any(pd.isna(v) for v in needed):
         return HOLD
 
-    crossed_up = (prev["ema_fast"] <= prev["ema_slow"]
-                  and row["ema_fast"] > row["ema_slow"])
-    crossed_down = (prev["ema_fast"] >= prev["ema_slow"]
-                    and row["ema_fast"] < row["ema_slow"])
+    crossed_up = (
+        prev["ema_fast"] <= prev["ema_slow"]
+        and row["ema_fast"] > row["ema_slow"]
+    )
+    crossed_down = (
+        prev["ema_fast"] >= prev["ema_slow"]
+        and row["ema_fast"] < row["ema_slow"]
+    )
 
     if crossed_down:
         return SELL
@@ -145,11 +160,14 @@ def latest_signal(df, cfg=DEFAULT_CONFIG):
     if atr is not None and not pd.isna(atr):
         stop = float(row["close"] - cfg.atr_stop_mult * atr)
 
+    rsi = None if pd.isna(row["rsi"]) else float(row["rsi"])
+    vol = None if pd.isna(row["vol_ratio"]) else float(row["vol_ratio"])
+
     return {
         "signal": signal_at(df, i, cfg),
         "price": float(row["close"]),
-        "rsi": None if pd.isna(row["rsi"]) else float(row["rsi"]),
-        "vol_ratio": None if pd.isna(row["vol_ratio"]) else float(row["vol_ratio"]),
+        "rsi": rsi,
+        "vol_ratio": vol,
         "suggested_stop": stop,
     }
 
@@ -164,16 +182,23 @@ def setup_score(df, cfg=DEFAULT_CONFIG):
     """
     last = len(df) - 1
     if last < 30:
-        return {"score": 0, "reasons": ["not enough data"], "flags": [],
-                "ret_24h": None}
+        return {
+            "score": 0,
+            "reasons": ["not enough data"],
+            "flags": [],
+            "ret_24h": None,
+        }
 
     row = df.iloc[last]
     close = float(row["close"])
-    score, reasons, flags = 0, [], []
+    score = 0
+    reasons = []
+    flags = []
 
     # Trend (25)
-    if pd.notna(row["ema_fast"]) and pd.notna(row["ema_slow"]) \
-            and row["ema_fast"] > row["ema_slow"]:
+    ema_fast = row["ema_fast"]
+    ema_slow = row["ema_slow"]
+    if pd.notna(ema_fast) and pd.notna(ema_slow) and ema_fast > ema_slow:
         score += 10
         reasons.append("fast EMA above slow EMA")
     trend = row.get("ema_trend")
@@ -206,7 +231,10 @@ def setup_score(df, cfg=DEFAULT_CONFIG):
             score += 8
 
     # Breakout: close to the 3-day high (15)
-    highs = df["high"] if "high" in df.columns else df["close"]
+    if "high" in df.columns:
+        highs = df["high"]
+    else:
+        highs = df["close"]
     high72 = float(highs.iloc[-72:].max())
     dist = close / high72 - 1
     if dist >= -0.03:
@@ -228,16 +256,6 @@ def setup_score(df, cfg=DEFAULT_CONFIG):
             score -= 20
             flags.append(f"already pumped +{ret24 * 100:.0f}% in 24h")
 
-       # Volatility: enough movement to matter, not chaos (10)
-    atr = row.get("atr")
-    if atr is not None and pd.notna(atr):
-        atr_pct = float(atr) / close
-        if 0.008 <= atr_pct <= 0.04:
-            score += 10
-        else:
-            score += 5
-        if atr_pct > 0.04:
-            flags.append(f"very volatile (ATR {atr_pct * 100:.1f}%)")
     # Volatility: enough movement to matter, not chaos (10)
     atr = row.get("atr")
     if atr is not None and pd.notna(atr):
@@ -248,3 +266,37 @@ def setup_score(df, cfg=DEFAULT_CONFIG):
             score += 5
         if atr_pct > 0.04:
             flags.append(f"very volatile (ATR {atr_pct * 100:.1f}%)")
+
+    score = max(0, min(100, score))
+    return {
+        "score": score,
+        "reasons": reasons,
+        "flags": flags,
+        "ret_24h": ret24,
+    }
+
+
+if __name__ == "__main__":
+    # Self-check on synthetic data (no network needed).
+    import random
+
+    random.seed(3)
+    price = 100.0
+    rows = []
+    for _ in range(600):
+        open_ = price
+        price *= 1 + random.gauss(0.0003, 0.01)
+        high = max(open_, price) * 1.003
+        low = min(open_, price) * 0.997
+        rows.append([open_, high, low, price, random.uniform(50, 150)])
+
+    cols = ["open", "high", "low", "close", "volume"]
+    data = add_indicators(pd.DataFrame(rows, columns=cols))
+
+    counts = {BUY: 0, SELL: 0, HOLD: 0}
+    for k in range(len(data)):
+        counts[signal_at(data, k)] += 1
+
+    print("Signal counts:", counts)
+    print("Latest:", latest_signal(data))
+    print("Score:", setup_score(data))
