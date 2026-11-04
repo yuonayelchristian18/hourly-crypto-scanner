@@ -351,4 +351,4 @@ def setup_score(df, cfg=DEFAULT_CONFIG):
 
 
 if __name__ == "__main__":
-    print("signals.py loaded successfully"
+    print("signals.py loaded successfully")
