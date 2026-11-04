@@ -156,6 +156,9 @@ def scan_coin(session, coin, pair_info, args, cfg):
     pair = pair_info["pair"]
     try:
         ticker_price = get_kraken_price(session, pair)
+        if args.max_price and ticker_price >= args.max_price:
+            print(f"{symbol}: skipped; price ${ticker_price:.4f} >= max ${args.max_price}")
+            return
         cg_price = coin.get("current_price")
         if cg_price and cg_price > 0:
             diff = abs(ticker_price - cg_price) / cg_price
@@ -229,11 +232,15 @@ def scan_coin(session, coin, pair_info, args, cfg):
 def main():
     parser = argparse.ArgumentParser(description="Kraken AI/meme coin alert scanner")
     parser.add_argument("--categories", default=DEFAULT_CATEGORIES)
-    parser.add_argument("--per-category", type=int, default=50)
+    parser.add_argument("--per-category", type=int, default=250)  # CoinGecko max per page
     parser.add_argument("--max-price", type=float, default=MAX_PRICE_DEFAULT)
-    parser.add_argument("--min-volume", type=float, default=100000)
-    parser.add_argument("--min-mcap", type=float, default=1000000)
+    parser.add_argument("--min-volume", type=float, default=50000)
+    parser.add_argument("--min-mcap", type=float, default=500000)
     parser.add_argument("--alert", type=float, default=70)
+    parser.add_argument("--all-kraken", action="store_true",
+                        help="Also scan every other Kraken USD pair (not just AI/meme categories)")
+    parser.add_argument("--max-coins", type=int, default=150,
+                        help="Cap on coins scanned per run (keeps run time bounded)")
     args = parser.parse_args()
     if args.max_price <= 0 or not 0 <= args.alert <= 100:
         parser.error("Invalid max-price or alert threshold")
@@ -253,7 +260,15 @@ def main():
             pair_info = pairs.get(sym)
             if pair_info:
                 matched.append((coin, pair_info))
-        print(f"Matched Kraken pairs: {len(matched)}")
+        if args.all_kraken:
+            seen_pairs = {pi["pair"] for _, pi in matched}
+            for sym, pi in sorted(pairs.items()):
+                if pi["pair"] in seen_pairs:
+                    continue
+                seen_pairs.add(pi["pair"])
+                matched.append(({"symbol": sym, "name": sym, "current_price": None}, pi))
+        matched = matched[:args.max_coins]
+        print(f"Matched Kraken pairs (scanning): {len(matched)}")
         for coin, pair_info in matched:
             scan_coin(session, coin, pair_info, args, cfg)
             time.sleep(0.5)
