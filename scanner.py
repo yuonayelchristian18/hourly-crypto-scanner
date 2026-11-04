@@ -198,8 +198,6 @@ def scan_coin(session, coin, pair_info, args, cfg):
             # Never allocate more than the reference account balance.
             position_size = min(raw_size, STARTING_BALANCE / entry)
             estimated_cost = position_size * entry * 2 * (FEE_RATE + SLIPPAGE_RATE)
-            if position_size * entry > STARTING_BALANCE:
-                qualifies = False
 
         row = {
             "scan_time": datetime.now(timezone.utc).isoformat(),
@@ -235,7 +233,7 @@ def main():
     parser.add_argument("--max-price", type=float, default=MAX_PRICE_DEFAULT)
     parser.add_argument("--min-volume", type=float, default=100000)
     parser.add_argument("--min-mcap", type=float, default=1000000)
-    parser.add_argument("--alert", type=float, default=80)
+    parser.add_argument("--alert", type=float, default=70)
     args = parser.parse_args()
     if args.max_price <= 0 or not 0 <= args.alert <= 100:
         parser.error("Invalid max-price or alert threshold")
