@@ -228,8 +228,23 @@ def setup_score(df, cfg=DEFAULT_CONFIG):
             score -= 20
             flags.append(f"already pumped +{ret24 * 100:.0f}% in 24h")
 
+       # Volatility: enough movement to matter, not chaos (10)
+    atr = row.get("atr")
+    if atr is not None and pd.notna(atr):
+        atr_pct = float(atr) / close
+        if 0.008 <= atr_pct <= 0.04:
+            score += 10
+        else:
+            score += 5
+        if atr_pct > 0.04:
+            flags.append(f"very volatile (ATR {atr_pct * 100:.1f}%)")
     # Volatility: enough movement to matter, not chaos (10)
     atr = row.get("atr")
     if atr is not None and pd.notna(atr):
         atr_pct = float(atr) / close
-        score += 10 if 0.008 
+        if 0.008 <= atr_pct <= 0.04:
+            score += 10
+        else:
+            score += 5
+        if atr_pct > 0.04:
+            flags.append(f"very volatile (ATR {atr_pct * 100:.1f}%)")
