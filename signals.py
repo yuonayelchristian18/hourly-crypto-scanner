@@ -129,6 +129,9 @@ def _sequential_setup(data, i, cfg):
     if i < 3:
         return None
     start = max(1, i - cfg.sequence_window)
+    # Speed-up: no sweep candle in the window means no setup is possible.
+    if not data["liquidity_sweep"].iloc[start:i - 1].any():
+        return None
     # Retest candle i must be later than both sweep and break candles.
     for sweep_i in range(start, i - 1):
         sweep = data.iloc[sweep_i]
