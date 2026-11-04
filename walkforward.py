@@ -5,10 +5,12 @@ settings are chosen using the training window, then applied to the unseen
 test window that follows. Only the test windows count toward the results.
 
 Needs scanner.py and signals.py in the same folder. Takes a few minutes.
+Kraken gives only ~30 days of hourly data, so treat results as a rough
+screen, not proof.
 
 Usage:
     python walkforward.py
-    python walkforward.py --max-coins 8 --bars 6000 --train 2000 --test 500
+    python walkforward.py --max-coins 8 --train 400 --test 160
 """
 
 import argparse
@@ -21,33 +23,15 @@ import pandas as pd
 import scanner as sc
 from signals import SignalConfig, add_indicators
 
-MIN_TRAIN_TRADES = 5
+MIN_TRAIN_TRADES = 3
 
 
 def get_history(session, base, symbol, total):
-    """Page backwards through Binance klines to collect `total` hourly candles."""
-    frames, end, remaining = [], None, total
-    while remaining > 0:
-        limit = min(1000, remaining)
-        params = {"symbol": symbol, "interval": "1h", "limit": limit}
-        if end is not None:
-            params["endTime"] = end
-        response = session.get(f"{base}/klines", params=params, timeout=20)
-        response.raise_for_status()
-        rows = response.json()
-        if not rows:
-            break
-        frames.append(pd.DataFrame(rows, columns=sc.COLUMNS))
-        end = int(rows[0][0]) - 1
-        remaining -= len(rows)
-        if len(rows) < limit:
-            break
-        time.sleep(0.2)
+    """Kraken returns at most 720 hourly candles per request (about 30 days).
 
-    if not frames:
-        return pd.DataFrame(columns=sc.COLUMNS)
-    df = pd.concat(frames[::-1], ignore_index=True)
-    return df.iloc[:-1].reset_index(drop=True)  # drop the still-forming candle
+    The extra paging Binance allowed is not available, so `total` is capped.
+    """
+    return sc.get_candles(session, base, symbol, min(total, sc.MAX_CANDLES) + 1)
 
 
 def build_grid():
@@ -117,9 +101,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--categories", default=sc.DEFAULT_CATEGORIES)
     parser.add_argument("--max-coins", type=int, default=12)
-    parser.add_argument("--bars", type=int, default=4000, help="hourly candles per coin")
-    parser.add_argument("--train", type=int, default=1500)
-    parser.add_argument("--test", type=int, default=500)
+    parser.add_argument("--bars", type=int, default=720, help="hourly candles per coin (Kraken max 720)")
+    parser.add_argument("--train", type=int, default=400)
+    parser.add_argument("--test", type=int, default=160)
     parser.add_argument("--csv", default="walkforward_results.csv")
     args = parser.parse_args()
 
@@ -127,6 +111,7 @@ def main():
     categories = [c.strip() for c in args.categories.split(",") if c.strip()]
     universe = sc.get_universe(session, categories, 100, 1.0, 1_000_000, 20_000_000)
     base, binance_symbols = sc.pick_binance(session)
+    sc.KRAKEN_PAIRS.update(binance_symbols)
 
     grid, default_cfg = build_grid(), SignalConfig()
     print(f"{len(universe)} candidate coins, {len(grid)} setting combinations, "
