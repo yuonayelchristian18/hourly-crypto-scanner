@@ -1,8 +1,6 @@
-
 name: Run scanner
 
 on:
-  push:
   workflow_dispatch:
   schedule:
     - cron: "0 * * * *"
@@ -10,6 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,4 +16,3 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: python scanner.py
-      - run: python walkforward.py
