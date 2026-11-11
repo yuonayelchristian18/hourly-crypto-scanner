@@ -25,7 +25,7 @@ class SignalConfig:
     min_vol_ratio: float = 1.2
     atr_period: int = 14
     atr_stop_mult: float = 2.0
-    reward_risk: float = 2.0
+    reward_risk: float = 0.7
     sweep_lookback: int = 20
     structure_lookback: int = 10
     sequence_window: int = 12
@@ -44,8 +44,8 @@ class SignalConfig:
             raise ValueError("Indicator periods must be positive")
         if self.min_vol_ratio < 0 or self.atr_stop_mult <= 0:
             raise ValueError("Invalid volume or ATR setting")
-        if self.reward_risk < 2:
-            raise ValueError("This strategy requires at least 2:1 reward/risk")
+        if self.reward_risk < 0.5:
+            raise ValueError("This strategy requires at least 0.5:1 reward/risk")
         if min(self.sweep_lookback, self.structure_lookback, self.sequence_window) < 3:
             raise ValueError("Lookback values must be at least 3")
 
